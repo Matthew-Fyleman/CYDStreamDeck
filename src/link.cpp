@@ -309,7 +309,7 @@ String infoJson() {
   doc["ip"] = WiFi.isConnected() ? WiFi.localIP().toString() : String("");
   doc["ssid"] = Settings::wifiSsid();
   doc["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
-  doc["icon_size"] = Deck::kIconSize;
+  doc["icon_size"] = Deck::kImageSize;
   doc["rows"] = Deck::kRows;
   doc["cols"] = Deck::kCols;
   doc["tz"] = s.tz;

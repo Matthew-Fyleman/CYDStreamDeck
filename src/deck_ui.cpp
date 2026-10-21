@@ -22,10 +22,19 @@ constexpr uint16_t kTileText = 0xC618;    // light grey
 constexpr uint16_t kTileHint = 0x632C;    // dim grey
 constexpr uint16_t kStatusBg = 0x10A2;    // near-black blue
 constexpr uint16_t kStatusText = TFT_WHITE;
-constexpr uint16_t kPressColor = TFT_WHITE;
-constexpr uint16_t kAckColor = 0x07E8;    // green
 constexpr uint16_t kLinkOk = 0x07E8;
 constexpr uint16_t kLinkOff = 0x528A;
+
+// Bevel palettes: highlight edge, shadow edge, bevel face.
+enum class Face { Normal, Pressed, Acked };
+struct BevelColors {
+  uint16_t light, dark, face;
+};
+constexpr BevelColors kBevelNormal = {0x9CF3, 0x10A2, 0x4A6B};   // slate, raised
+constexpr BevelColors kBevelPressed = {0xFFFF, 0x4208, 0xBDF7};  // bright, sunken
+constexpr BevelColors kBevelAcked = {0x9FF3, 0x01E0, 0x0600};    // green, sunken
+constexpr int16_t kOuterRadius = 12;
+constexpr int16_t kEdge = 2;  // width of the highlight/shadow edges
 
 // Touch state.
 bool gTouchDown = false;
@@ -35,6 +44,7 @@ int gDownTarget = -2;  // -1 = status row, 0..11 = icon, -2 = none
 
 // Press flash.
 int gFlashPos = -1;
+bool gFlashAcked = false;
 uint32_t gFlashAt = 0;
 
 // Status row.
@@ -62,11 +72,12 @@ int hitTest(int16_t px, int16_t py) {
   return -2;
 }
 
-void drawPlaceholder(int pos, int16_t x, int16_t y) {
+// Draws the label (or "row,col") into the recess at ix, iy.
+void drawPlaceholder(int pos, int16_t ix, int16_t iy) {
   TFT_eSPI& tft = *gTft;
-  const int16_t cx = x + Deck::kIconSize / 2;
-  const int16_t cy = y + Deck::kIconSize / 2;
-  tft.fillRoundRect(x, y, Deck::kIconSize, Deck::kIconSize, 10, kTileBg);
+  const int16_t cx = ix + Deck::kImageSize / 2;
+  const int16_t cy = iy + Deck::kImageSize / 2;
+  tft.fillRect(ix, iy, Deck::kImageSize, Deck::kImageSize, kTileBg);
   tft.setTextDatum(MC_DATUM);
   const String& label = Settings::get().labels[pos];
   if (label.length() == 0) {
@@ -75,7 +86,7 @@ void drawPlaceholder(int pos, int16_t x, int16_t y) {
     return;
   }
   tft.setTextColor(kTileText, kTileBg);
-  if (tft.textWidth(label, 2) <= Deck::kIconSize - 8) {
+  if (tft.textWidth(label, 2) <= Deck::kImageSize - 6) {
     tft.drawString(label, cx, cy, 2);
     return;
   }
@@ -92,11 +103,44 @@ void drawPlaceholder(int pos, int16_t x, int16_t y) {
   tft.drawString(label.substring(atSpace ? split + 1 : split), cx, cy + 9, 2);
 }
 
-void drawFrame(int pos, uint16_t color) {
+// Rounded pseudo-3D bevel filling exactly the icon cell, so the gaps between
+// icons are untouched. Raised when idle (light top-left, shadow bottom-right),
+// sunken while pressed. The image recess inside gets an inset outline.
+void drawBevel(int16_t x, int16_t y, Face face) {
+  TFT_eSPI& tft = *gTft;
+  const BevelColors& c = face == Face::Normal ? kBevelNormal
+                         : face == Face::Pressed ? kBevelPressed : kBevelAcked;
+  const bool raised = face == Face::Normal;
+  const uint16_t topLeft = raised ? c.light : c.dark;
+  const uint16_t bottomRight = raised ? c.dark : c.light;
+  const int16_t s = Deck::kIconSize;
+
+  tft.fillSmoothRoundRect(x, y, s, s, kOuterRadius, bottomRight, kBg);
+  tft.fillSmoothRoundRect(x, y, s - kEdge - 1, s - kEdge - 1, kOuterRadius, topLeft, bottomRight);
+  tft.fillSmoothRoundRect(x + kEdge, y + kEdge, s - 2 * kEdge, s - 2 * kEdge, kOuterRadius - kEdge,
+                          c.face, topLeft);
+
+  // Recess outline: shadowed on the top-left, lit on the bottom-right.
+  const int16_t r0 = Deck::kBevel - 1;
+  const int16_t r1 = Deck::kBevel + Deck::kImageSize;
+  const int16_t len = Deck::kImageSize + 2;
+  tft.drawFastHLine(x + r0, y + r0, len, bottomRight);
+  tft.drawFastVLine(x + r0, y + r0, len, bottomRight);
+  tft.drawFastHLine(x + r0, y + r1, len, topLeft);
+  tft.drawFastVLine(x + r1, y + r0, len, topLeft);
+}
+
+void drawIcon(int pos, Face face) {
+  if (pos < 0 || pos >= Deck::kButtons) return;
   int16_t x, y;
   iconRect(pos, x, y);
-  for (int i = 0; i < 4; ++i) {
-    gTft->drawRect(x + i, y + i, Deck::kIconSize - 2 * i, Deck::kIconSize - 2 * i, color);
+  drawBevel(x, y, face);
+  const int16_t ix = x + Deck::kBevel;
+  const int16_t iy = y + Deck::kBevel;
+  if (gIconBuf && IconStore::load(pos, gIconBuf)) {
+    gTft->pushImage(ix, iy, Deck::kImageSize, Deck::kImageSize, reinterpret_cast<uint16_t*>(gIconBuf));
+  } else {
+    drawPlaceholder(pos, ix, iy);
   }
 }
 
@@ -157,10 +201,11 @@ void handleTouch() {
       gDownAt = now;
       gDownTarget = hitTest(x, y);
       if (gDownTarget >= 0) {
-        if (gFlashPos >= 0 && gFlashPos != gDownTarget) DeckUI::redrawIcon(gFlashPos);
+        if (gFlashPos >= 0 && gFlashPos != gDownTarget) drawIcon(gFlashPos, Face::Normal);
         gFlashPos = gDownTarget;
         gFlashAt = now;
-        drawFrame(gDownTarget, kPressColor);
+        gFlashAcked = false;
+        drawIcon(gDownTarget, Face::Pressed);
         if (gOnPress) gOnPress(gDownTarget);
       } else if (gDownTarget == -1) {
         gIpUntil = now + Deck::kIpShowMs;
@@ -213,15 +258,9 @@ bool readTouch(int16_t& x, int16_t& y) {
 }
 
 void redrawIcon(int pos) {
-  if (pos < 0 || pos >= Deck::kButtons) return;
-  int16_t x, y;
-  iconRect(pos, x, y);
-  if (gIconBuf && IconStore::load(pos, gIconBuf)) {
-    gTft->pushImage(x, y, Deck::kIconSize, Deck::kIconSize, reinterpret_cast<uint16_t*>(gIconBuf));
-  } else {
-    gTft->fillRect(x, y, Deck::kIconSize, Deck::kIconSize, kBg);
-    drawPlaceholder(pos, x, y);
-  }
+  Face face = Face::Normal;
+  if (pos == gFlashPos) face = gFlashAcked ? Face::Acked : Face::Pressed;
+  drawIcon(pos, face);
 }
 
 void redrawStatus() { drawStatus(true); }
@@ -233,7 +272,9 @@ void redrawAll() {
 }
 
 void onPressAcked(int pos) {
-  if (pos == gFlashPos) drawFrame(pos, kAckColor);
+  if (pos != gFlashPos || gFlashAcked) return;
+  gFlashAcked = true;
+  drawIcon(pos, Face::Acked);
 }
 
 void showMessage(const char* title, const String& body) {
@@ -260,7 +301,7 @@ void loop() {
   if (gFlashPos >= 0 && now - gFlashAt >= Deck::kPressFlashMs) {
     const int pos = gFlashPos;
     gFlashPos = -1;
-    redrawIcon(pos);
+    drawIcon(pos, Face::Normal);
   }
   if (now - gLastStatusCheck >= 250) {
     gLastStatusCheck = now;

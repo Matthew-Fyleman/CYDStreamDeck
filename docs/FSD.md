@@ -70,7 +70,7 @@ The credentials are stored in a dedicated NVS namespace (`wifi`). No interface (
 ```
 x: 42                                                      438
    +--------+ +--------+ +--------+ +--------+    y=2
-   |  0     | |  1     | |  2     | |  3     |    96×96 icons
+   |  0     | |  1     | |  2     | |  3     |    96×96 cells
    +--------+ +--------+ +--------+ +--------+    4 px gaps
    |  4     | |  5     | |  6     | |  7     |
    +--------+ +--------+ +--------+ +--------+
@@ -79,7 +79,13 @@ x: 42                                                      438
 [        17:45    Wed 21 Oct 2026                    ●]  y=300..319 (20 px)
 ```
 
-* The grid has 3 rows × 4 columns of **96×96 px** square icons, with a **4 px** gap horizontally and vertically. The grid is centred horizontally.
+* The grid has 3 rows × 4 columns of **96×96 px** square cells, with a **4 px** gap horizontally and vertically. The grid is centred horizontally.
+* Each cell is drawn as a **rounded pseudo-3D button**. The bevel sits entirely inside the 96×96 cell, so the 4 px gaps stay clear background. The bevel has:
+  * an anti-aliased outer edge with a 12 px corner radius
+  * a 2 px light edge on the top and left, and a 2 px shadow edge on the bottom and right (a raised look)
+  * a slate face
+  * an inset outline around the image recess
+* The icon image sits in an **84×84 px** recess inside the 6 px bevel.
 * Each position has an index from 0 to 11, counted row by row (`pos = row*4 + col`).
 * An icon with no image is drawn as a rounded tile showing its label, wrapped onto up to two lines, or its "row,col" if it has no label.
 * The **status row** is 20 px high and sits below the grid without overlapping it. It shows the time (hours and minutes) and the date, using the configured time zone and formats. Before NTP sync it shows "Connecting to WiFi..." or "Syncing time...".
@@ -89,7 +95,7 @@ x: 42                                                      438
 
 | Touch | Result |
 |---|---|
-| Touch inside an icon | The press is sent to the PC immediately, on touch-down. The icon gets a white 4 px frame, which turns **green** when the PC acknowledges the press. The icon returns to normal after 300 ms. The highlight is never sticky. |
+| Touch inside an icon | The press is sent to the PC immediately, on touch-down. The bevel flips to **sunken** (light on the bottom and right) with a bright face, and the face turns **green** when the PC acknowledges the press. The button returns to its raised state after 300 ms. The highlight is never sticky. |
 | Touch in a gap or margin | Ignored |
 | Tap in the status row | Shows `IP a.b.c.d   CYDSD-XXXXXX` for 10 s |
 | Hold the status row for 10 s | After 3 s a countdown appears. At 10 s the stored WiFi credentials are erased and the device restarts into the setup portal. This is the recovery path if the WiFi changes. |
@@ -106,7 +112,7 @@ A new press is only accepted after the finger has been lifted, so holding does n
 | `name` | Friendly name | `CYD Stream Deck` |
 | `l0`–`l11` | Button labels (max 24 chars) | empty |
 
-Icons are stored in LittleFS as `/icons/<pos>.bin`: raw RGB565, big-endian, 96×96 (18,432 bytes). Uploads go to a temporary file first and only replace the icon once the size is correct.
+Icons are stored in LittleFS as `/icons/<pos>.bin`: raw RGB565, big-endian, 84×84 (14,112 bytes). Uploads go to a temporary file first and only replace the icon once the size is correct.
 
 ## 4. Windows software
 
@@ -184,7 +190,7 @@ A Tkinter window with the following sections:
   * A checkbox that controls whether the daemon also listens on USB.
 * **Buttons:** a 3×4 grid mirroring the deck, with thumbnails and labels. Selecting a cell lets you edit:
   * the **label**
-  * the **image**: the chosen file (PNG, JPEG, BMP, GIF, ICO or WebP) is copied into the configuration folder, then scaled and letterboxed to 96×96 on upload
+  * the **image**: the chosen file (PNG, JPEG, BMP, GIF, ICO or WebP) is copied into the configuration folder, then scaled and letterboxed to 84×84 on upload
   * the **actions**: add a program, URL, file/folder or wait; edit; remove; reorder; and **Test now**, which runs the actions locally
 * **Time and date row:**
   * a time zone list of 54 common zones with their POSIX rules, so DST is automatic, or a custom POSIX TZ string
@@ -234,7 +240,7 @@ Debug output never starts with `CYDSD `, so the PC ignores it. The serial link s
 | `GET /` | – | Status page |
 | `GET /api/info` | – | id, name, fw, ip, ssid, rssi, icon_size, rows, cols, tz, formats, time, pc_connected, icons[12], labels[12] |
 | `POST /api/settings` | JSON `{tz, time_fmt, date_fmt, name, labels[12]}` | All fields are optional. The values are validated, saved, and the screen is redrawn. |
-| `POST /api/icon?pos=N` | multipart file (18,432 bytes, RGB565 BE) | |
+| `POST /api/icon?pos=N` | multipart file (14,112 bytes, 84×84 RGB565 BE) | |
 | `POST /api/icon/delete?pos=N` | – | |
 | `POST /api/wifi` | JSON `{ssid, pass}` | The device restarts |
 | `POST /api/press?pos=N` | – | Simulates a touch on position N (for testing) |
@@ -263,13 +269,13 @@ pythonw cydsd_daemon.py         # or tick "Start daemon when I sign in to Window
 
 | Test | Result |
 |---|---|
-| Firmware compile (`pio run`) | Passed, no warnings. RAM 14.9 %, flash 44.2 % of the 2 MB app partition. |
+| Firmware compile (`pio run`) | Passed, no warnings (TFT_eSPI's TOUCH_CS notice is suppressed because touch is handled by the XPT2046 library). RAM 14.9 %, flash 44.2 % of the 2 MB app partition. |
 | Upload to the CYD on COM4 | Passed |
 | WiFi setup portal | Device joined the home network (192.168.1.198) through the portal |
 | Serial auto-detect (`find_serial_devices`) | Found `CYDSD-503D20` on COM4 in 0.1 s |
-| Serial: settings, icon upload (2.8 s per icon), delete | Passed |
+| Serial: settings, icon upload, delete | Passed (2.8 s per 96×96 icon, before the bevel change) |
 | UDP discovery (broadcast and unicast) | Passed |
-| HTTP: settings, icon upload (1.6 s per icon), delete, info | Passed |
+| HTTP: settings, icon upload, delete, info | Passed (1.6 s per 96×96 icon, before the bevel change; 84×84 re-tested after it) |
 | Daemon end-to-end, WiFi only: press → ACK → action executed | Passed, 3 out of 3 presses |
 | Daemon with WiFi and USB together: duplicates removed | Passed |
 | Daemon idle footprint | 0.03 CPU-s/min, 33 MB |

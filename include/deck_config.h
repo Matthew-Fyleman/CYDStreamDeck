@@ -15,7 +15,7 @@ constexpr int16_t kScreenH = 320;
 constexpr int kRows = 3;
 constexpr int kCols = 4;
 constexpr int kButtons = kRows * kCols;
-constexpr int16_t kIconSize = 96;   // pixels, square
+constexpr int16_t kIconSize = 96;   // pixels, square cell including the bevel border
 constexpr int16_t kGap = 4;         // spacing between icons (<= 5 px per spec)
 constexpr int16_t kGridW = kCols * kIconSize + (kCols - 1) * kGap;  // 396
 constexpr int16_t kGridH = kRows * kIconSize + (kRows - 1) * kGap;  // 296
@@ -27,7 +27,11 @@ constexpr int16_t kStatusH = 20;
 constexpr int16_t kStatusY = kScreenH - kStatusH;  // 300
 static_assert(kGridY + kGridH <= kStatusY, "grid overlaps status row");
 
-constexpr uint32_t kIconBytes = static_cast<uint32_t>(kIconSize) * kIconSize * 2;  // RGB565
+// Each cell has a rounded pseudo-3D bevel drawn inside it, so the gaps are
+// unaffected; the icon image sits in the recess within the bevel.
+constexpr int16_t kBevel = 6;
+constexpr int16_t kImageSize = kIconSize - 2 * kBevel;  // 84
+constexpr uint32_t kIconBytes = static_cast<uint32_t>(kImageSize) * kImageSize * 2;  // RGB565
 
 // Networking.
 constexpr uint16_t kUdpPort = 47800;

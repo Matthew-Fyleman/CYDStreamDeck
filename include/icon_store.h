@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-// Icons are stored in LittleFS as raw big-endian RGB565, Deck::kIconSize
+// Icons are stored in LittleFS as raw big-endian RGB565, Deck::kImageSize
 // square, one file per grid position: /icons/<pos>.bin
 namespace IconStore {
 

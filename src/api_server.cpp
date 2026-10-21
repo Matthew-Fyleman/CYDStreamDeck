@@ -4,6 +4,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 
+#include "auth.h"
 #include "deck_config.h"
 #include "deck_ui.h"
 #include "icon_store.h"
@@ -17,6 +18,8 @@ ApiServer::ChangeHandler gOnChange = nullptr;
 ApiServer::PressHandler gOnPress = nullptr;
 bool gStarted = false;
 bool gUploadOk = false;
+bool gUploadUnauthorized = false;
+Auth::Sha256* gUploadHash = nullptr;
 
 // No CORS headers: the configuration app is not a browser, and web pages must
 // not be able to read or drive the API.
@@ -53,11 +56,39 @@ bool requestAllowed() {
 
 bool isJsonRequest() { return gServer.header("Content-Type").startsWith("application/json"); }
 
-// Returns true (after replying 403) if the request must not be handled.
-bool reject() {
-  if (requestAllowed()) return false;
-  sendJson(403, "{\"ok\":false,\"error\":\"forbidden\"}");
-  return true;
+// Once paired, API requests must carry "X-CYDSD-Auth: <challenge> <mac>",
+// where the challenge comes from GET /api/challenge and
+//   mac = HMAC(key, "CYDSD-HTTP <method> <path> <pos or -> <challenge> <sha256 of body>")
+// The challenge is single use, so a captured request cannot be replayed.
+bool authorized(const String& bodySha) {
+  if (!Auth::paired()) return true;
+  const String h = gServer.header("X-CYDSD-Auth");
+  const int sp = h.indexOf(' ');
+  if (sp <= 0) return false;
+  const String challenge = h.substring(0, sp);
+  const String text = String("CYDSD-HTTP ") + (gServer.method() == HTTP_POST ? "POST " : "GET ") +
+                      gServer.uri() + " " + (gServer.hasArg("pos") ? gServer.arg("pos") : String("-")) + " " +
+                      challenge + " " + bodySha;
+  return Auth::verify(text, h.substring(sp + 1)) && Auth::consumeChallenge(challenge);
+}
+
+String plainBodySha() {
+  const String& body = gServer.arg("plain");
+  return Auth::sha256Hex(reinterpret_cast<const uint8_t*>(body.c_str()), body.length());
+}
+
+// Returns true (after replying 403/401) if the request must not be handled.
+// needAuth is false only where authentication was already done elsewhere.
+bool reject(bool needAuth = true) {
+  if (!requestAllowed()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"forbidden\"}");
+    return true;
+  }
+  if (needAuth && !authorized(plainBodySha())) {
+    sendJson(401, "{\"ok\":false,\"error\":\"unauthorized (pair this PC with the deck over USB)\"}");
+    return true;
+  }
+  return false;
 }
 
 int posArg() {
@@ -67,7 +98,7 @@ int posArg() {
 }
 
 void handleRoot() {
-  if (reject()) return;
+  if (reject(false)) return;
   String html =
       "<!doctype html><html><head><meta name=viewport content='width=device-width'>"
       "<title>CYD Stream Deck</title><style>body{font-family:sans-serif;margin:2em;"
@@ -92,10 +123,22 @@ void handleSettings() {
 void handleIconUpload() {
   HTTPUpload& up = gServer.upload();
   if (up.status == UPLOAD_FILE_START) {
+    gUploadUnauthorized = false;
+    delete gUploadHash;
+    gUploadHash = new Auth::Sha256();
     gUploadOk = requestAllowed() && posArg() >= 0 && IconStore::beginWrite(posArg());
   } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (gUploadOk) gUploadOk = IconStore::write(up.buf, up.currentSize);
+    if (gUploadOk) {
+      gUploadHash->update(up.buf, up.currentSize);
+      gUploadOk = IconStore::write(up.buf, up.currentSize);
+    }
   } else if (up.status == UPLOAD_FILE_END) {
+    // The temporary file only replaces the icon if the MAC covers its bytes.
+    if (gUploadOk && !authorized(gUploadHash->hex())) {
+      gUploadOk = false;
+      gUploadUnauthorized = true;
+      IconStore::abortWrite();
+    }
     if (gUploadOk) gUploadOk = IconStore::endWrite();
   } else if (up.status == UPLOAD_FILE_ABORTED) {
     IconStore::abortWrite();
@@ -104,7 +147,13 @@ void handleIconUpload() {
 }
 
 void handleIconDone() {
-  if (reject()) return;
+  delete gUploadHash;
+  gUploadHash = nullptr;
+  if (reject(false)) return;  // authenticated in handleIconUpload against the file bytes
+  if (gUploadUnauthorized) {
+    gUploadUnauthorized = false;
+    return sendJson(401, "{\"ok\":false,\"error\":\"unauthorized\"}");
+  }
   const int pos = posArg();
   sendResult(gUploadOk, "icon upload failed (expect " + String(Deck::kIconBytes) + " bytes RGB565)");
   if (gUploadOk && gOnChange) gOnChange(pos);
@@ -165,9 +214,12 @@ void begin(ChangeHandler onChange, PressHandler onPress) {
   gOnChange = onChange;
   gOnPress = onPress;
   if (gStarted) return;
-  static const char* kHeaders[] = {"Origin", "X-CYDSD", "Content-Type"};
+  static const char* kHeaders[] = {"Origin", "X-CYDSD", "Content-Type", "X-CYDSD-Auth"};
   gServer.collectHeaders(kHeaders, sizeof(kHeaders) / sizeof(kHeaders[0]));
   gServer.on("/", HTTP_GET, handleRoot);
+  gServer.on("/api/challenge", HTTP_GET, [] {
+    if (!reject(false)) sendJson(200, "{\"challenge\":\"" + Auth::issueChallenge() + "\"}");
+  });
   gServer.on("/api/info", HTTP_GET, [] {
     if (!reject()) sendJson(200, Link::infoJson());
   });

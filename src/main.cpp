@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include "api_server.h"
+#include "auth.h"
 #include "deck_config.h"
 #include "deck_ui.h"
 #include "display_init.h"
@@ -107,6 +108,7 @@ void setup() {
 
   initHardware();
   Settings::begin();
+  Auth::begin();
   IconStore::begin();
   Link::begin(onChange);
   DeckUI::begin(tft, touch, onPress);

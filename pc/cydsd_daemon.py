@@ -19,6 +19,7 @@ import concurrent.futures
 import logging
 import logging.handlers
 import os
+import secrets
 import select
 import socket
 import sys
@@ -48,22 +49,35 @@ log = logging.getLogger("cydsd")
 class ConfigWatcher:
     def __init__(self):
         self._mtime = None
+        self._keys_mtime = None
         self.cfg = common.default_config()
+        self.key: bytes | None = None  # pairing key for the configured deck
         self.check()
 
-    def check(self) -> bool:
+    @staticmethod
+    def _stat(path) -> float | None:
         try:
-            mtime = common.CONFIG_PATH.stat().st_mtime
+            return path.stat().st_mtime
         except FileNotFoundError:
-            mtime = None
-        if mtime == self._mtime:
+            return None
+
+    def check(self) -> bool:
+        mtime = self._stat(common.CONFIG_PATH)
+        keys_mtime = self._stat(common.KEYS_PATH)
+        if mtime == self._mtime and keys_mtime == self._keys_mtime:
             return False
-        self._mtime = mtime
-        try:
-            self.cfg = common.load_config()
-            log.info("Configuration loaded (%s)", common.CONFIG_PATH)
-        except Exception as e:  # keep the previous config on a bad file
-            log.error("Could not load configuration: %s", e)
+        if mtime != self._mtime:
+            try:
+                self.cfg = common.load_config()
+                log.info("Configuration loaded (%s)", common.CONFIG_PATH)
+            except Exception as e:  # keep the previous config on a bad file
+                log.error("Could not load configuration: %s", e)
+        self._mtime, self._keys_mtime = mtime, keys_mtime
+        key = common.load_key(self.device_id)
+        if (key is None) != (self.key is None) or key != self.key:
+            log.info("Pairing key for %s: %s", self.device_id or "(no device id)",
+                     "loaded, WiFi messages are authenticated" if key else "none, WiFi is unauthenticated")
+        self.key = key
         return True
 
     @property
@@ -269,6 +283,13 @@ def udp_loop(watcher: ConfigWatcher, dispatcher: Dispatcher, stop: threading.Eve
     learned_ip = ""  # first deck address seen, used when the config has no IP
     subscribed = False
     rejected_logged: set[str] = set()
+    # Authenticated session state (see include/link.h). The nonce binds the
+    # deck's presses to this daemon run; boot and max_seq reject replays.
+    nonce = secrets.token_hex(8)
+    sent_ts: list[int] = []   # recent SUBSCRIBE timestamps, echoed back in SUBSCRIBED
+    boot = ""                 # deck boot id from the latest SUBSCRIBED
+    max_seq = 0
+    last_ts = 0
 
     def deck_ip() -> str:
         # The configured address wins; a DHCP reservation keeps it valid.
@@ -280,7 +301,13 @@ def udp_loop(watcher: ConfigWatcher, dispatcher: Dispatcher, stop: threading.Eve
             last_heartbeat = now
             watcher.check()
             target = watcher.device_id or "*"
-            msg = f"{common.TAG} SUBSCRIBE {target}".encode()
+            if watcher.key and watcher.device_id:
+                ts = max(int(time.time()), last_ts + 1)  # strictly increasing for the deck
+                last_ts = ts
+                sent_ts = (sent_ts + [ts])[-4:]
+                msg = common.sign(watcher.key, f"{common.TAG} SUBSCRIBE {watcher.device_id} {nonce} {ts}").encode()
+            else:
+                msg = f"{common.TAG} SUBSCRIBE {target}".encode()
             # Unicast to the deck once it answers; broadcast only to find it.
             dests = {deck_ip()} if deck_ip() else set()
             if not dests or now - last_subscribed > SUBSCRIBE_FALLBACK_S:
@@ -298,7 +325,8 @@ def udp_loop(watcher: ConfigWatcher, dispatcher: Dispatcher, stop: threading.Eve
             data, addr = sock.recvfrom(512)
         except OSError:
             continue
-        parts = data.decode(errors="replace").strip().split()
+        line = data.decode(errors="replace").strip()
+        parts = line.split()
         if len(parts) < 2 or parts[0] != common.TAG:
             continue
         # Only the deck's own address is trusted. Anything else is dropped
@@ -308,6 +336,34 @@ def udp_loop(watcher: ConfigWatcher, dispatcher: Dispatcher, stop: threading.Eve
                 rejected_logged.add(addr[0])
                 log.warning("Ignoring %s from %s (deck is at %s; use 'Find device' if it moved)",
                             parts[1], addr[0], deck_ip())
+            continue
+        if watcher.key and watcher.device_id:
+            # Paired: only correctly signed messages for this session count.
+            text = common.verify_signed(watcher.key, line)
+            if text is None:
+                if "forged" not in rejected_logged:
+                    rejected_logged.add("forged")
+                    log.warning("Ignoring unsigned or forged %s from %s", parts[1], addr[0])
+                continue
+            f = text.split()
+            if f[1] == "PRESS" and len(f) == 7 and f[2].upper() == watcher.device_id.upper() and f[5] == nonce:
+                _, _, dev_id, pos, seq, _, press_boot = f
+                if press_boot != boot or not seq.isdigit():
+                    continue  # from an earlier boot, i.e. replayed
+                ack = common.sign(watcher.key, f"{common.TAG} ACK {seq} {boot} {nonce}")
+                sock.sendto(ack.encode(), addr)  # retries of an accepted press are ACKed too
+                if int(seq) > max_seq:
+                    max_seq = int(seq)
+                    dispatcher.press(dev_id, pos, seq, f"WiFi {addr[0]}")
+            elif (f[1] == "SUBSCRIBED" and len(f) == 6 and f[2].upper() == watcher.device_id.upper()
+                  and f[3] == nonce and f[4].isdigit() and int(f[4]) in sent_ts):
+                if f[5] != boot:
+                    boot, max_seq = f[5], 0
+                    log.info("Subscribed to %s at %s (authenticated, deck boot %s)", f[2], addr[0], boot)
+                subscribed = True
+                last_subscribed = now
+                if not watcher.device_ip:
+                    learned_ip = addr[0]
             continue
         if parts[1] == "PRESS" and len(parts) == 5:
             _, _, dev_id, pos, seq = parts

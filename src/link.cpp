@@ -4,7 +4,9 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <mbedtls/base64.h>
+#include <time.h>
 
+#include "auth.h"
 #include "deck_config.h"
 #include "deck_ui.h"
 #include "icon_store.h"
@@ -16,10 +18,15 @@ Link::ChangeHandler gOnChange = nullptr;
 WiFiUDP gUdp;
 bool gUdpStarted = false;
 
+// A daemon that asked for presses. When paired, each subscriber is identified
+// by the nonce its daemon chose at start-up, and its SUBSCRIBE timestamps must
+// keep increasing so a captured SUBSCRIBE cannot be replayed.
 struct Subscriber {
   IPAddress ip;
   uint16_t port = 0;
   uint32_t lastSeen = 0;
+  String nonce;  // empty for unauthenticated (unpaired) subscribers
+  uint32_t lastTs = 0;
 };
 constexpr int kMaxSubscribers = 4;
 Subscriber gSubs[kMaxSubscribers];
@@ -66,11 +73,18 @@ void udpSend(const IPAddress& ip, uint16_t port, const String& msg) {
   gUdp.endPacket();
 }
 
-void subscribe(const IPAddress& ip, uint16_t port) {
+void clearSubscribers() {
+  for (Subscriber& s : gSubs) s = Subscriber();
+}
+
+// nonce is empty for an unauthenticated subscription.
+void subscribe(const IPAddress& ip, uint16_t port, const String& nonce = String(), uint32_t ts = 0) {
   const uint32_t now = millis();
   int slot = -1;
   for (int i = 0; i < kMaxSubscribers; ++i) {
-    if (gSubs[i].port == port && gSubs[i].ip == ip) {
+    const bool same = nonce.length() ? gSubs[i].nonce == nonce
+                                     : gSubs[i].nonce.length() == 0 && gSubs[i].port == port && gSubs[i].ip == ip;
+    if (gSubs[i].port && same) {
       slot = i;
       break;
     }
@@ -85,20 +99,59 @@ void subscribe(const IPAddress& ip, uint16_t port) {
       }
       if (gSubs[i].lastSeen < gSubs[slot].lastSeen) slot = i;
     }
-    gSubs[slot].ip = ip;
-    gSubs[slot].port = port;
-    Serial.printf("[link] subscriber %s:%u\n", ip.toString().c_str(), port);
+    gSubs[slot] = Subscriber();
+    gSubs[slot].nonce = nonce;
+    Serial.printf("[link] subscriber %s:%u%s\n", ip.toString().c_str(), port,
+                  nonce.length() ? " (authenticated)" : "");
   }
+  gSubs[slot].ip = ip;
+  gSubs[slot].port = port;
+  gSubs[slot].lastTs = ts;
   gSubs[slot].lastSeen = now;
 }
 
+const Subscriber* subscriberByNonce(const String& nonce) {
+  const uint32_t now = millis();
+  for (const Subscriber& s : gSubs) {
+    if (s.port && s.nonce.length() && s.nonce == nonce && now - s.lastSeen <= Deck::kSubscriberTtlMs) return &s;
+  }
+  return nullptr;
+}
+
+// Splits on single spaces into at most maxParts fields. Returns the count.
+int split(const String& in, String* parts, int maxParts) {
+  int n = 0, start = 0;
+  while (n < maxParts && start <= static_cast<int>(in.length())) {
+    int sp = in.indexOf(' ', start);
+    if (sp < 0 || n == maxParts - 1) sp = in.length();
+    parts[n++] = in.substring(start, sp);
+    start = sp + 1;
+  }
+  return n;
+}
+
+bool isHex(const String& s, size_t len) {
+  if (s.length() != len) return false;
+  for (char c : s) {
+    if (!isxdigit(static_cast<unsigned char>(c))) return false;
+  }
+  return true;
+}
+
 void transmitPress(const Pending& p) {
+  // USB is trusted (physical access), so the serial copy is never signed.
   const String msg = String(Deck::kProtoTag) + " PRESS " + Settings::deviceId() + " " +
                      String(p.pos) + " " + String(p.seq);
   Serial.println(msg);
   const uint32_t now = millis();
   for (const Subscriber& s : gSubs) {
-    if (s.port && now - s.lastSeen <= Deck::kSubscriberTtlMs) udpSend(s.ip, s.port, msg);
+    if (!s.port || now - s.lastSeen > Deck::kSubscriberTtlMs) continue;
+    if (s.nonce.length()) {
+      const String text = msg + " " + s.nonce + " " + Auth::bootId();
+      udpSend(s.ip, s.port, text + " " + Auth::mac(text));
+    } else if (!Auth::paired()) {
+      udpSend(s.ip, s.port, msg);
+    }
   }
 }
 
@@ -122,6 +175,36 @@ bool parse(const String& line, String& verb, String& rest) {
   rest = sp < 0 ? String() : body.substring(sp + 1);
   rest.trim();
   return true;
+}
+
+// Signed UDP commands, used once the device is paired:
+//   CYDSD SUBSCRIBE <id> <nonce> <ts> <mac>
+//     -> CYDSD SUBSCRIBED <id> <nonce> <ts> <boot> <mac>
+//   CYDSD ACK <seq> <boot> <nonce> <mac>
+void handleSignedUdp(const String& line, const String& verb, const String& rest) {
+  String text;
+  if (!Auth::verifySigned(line, text)) return;  // silently drop forgeries
+  String f[5];
+  if (verb == "SUBSCRIBE") {
+    if (split(rest, f, 5) != 4 || !f[0].equalsIgnoreCase(Settings::deviceId()) || !isHex(f[1], 16)) return;
+    const uint32_t ts = strtoul(f[2].c_str(), nullptr, 10);
+    const time_t now = time(nullptr);
+    if (now > 1700000000 && labs(static_cast<long>(now) - static_cast<long>(ts)) > 120) return;
+    String nonce = f[1];
+    nonce.toLowerCase();
+    const Subscriber* existing = subscriberByNonce(nonce);
+    if (existing && ts <= existing->lastTs) return;  // replayed
+    subscribe(gUdp.remoteIP(), gUdp.remotePort(), nonce, ts);
+    const String reply = String(Deck::kProtoTag) + " SUBSCRIBED " + Settings::deviceId() + " " + nonce + " " +
+                         f[2] + " " + Auth::bootId();
+    udpSend(gUdp.remoteIP(), gUdp.remotePort(), reply + " " + Auth::mac(reply));
+  } else if (verb == "ACK") {
+    if (split(rest, f, 5) != 4 || f[1] != Auth::bootId()) return;
+    String nonce = f[2];
+    nonce.toLowerCase();
+    if (!subscriberByNonce(nonce)) return;
+    handleAck(strtoul(f[0].c_str(), nullptr, 10));
+  }
 }
 
 // Commands common to UDP and serial. Returns true if handled.
@@ -156,6 +239,10 @@ void handleUdp() {
     line.trim();
     String verb, rest, reply;
     if (!parse(line, verb, rest)) continue;
+    if (Auth::paired() && verb != "DISCOVER") {
+      handleSignedUdp(line, verb, rest);
+      continue;
+    }
     bool sub = false;
     handleCommon(verb, rest, reply, &sub);
     if (sub) subscribe(gUdp.remoteIP(), gUdp.remotePort());
@@ -220,6 +307,24 @@ void handleSerialLine(const String& line) {
     } else {
       serialReply("ERR incomplete icon");
     }
+  } else if (verb == "PAIR") {
+    uint8_t key[64];
+    size_t n = 0;
+    if (mbedtls_base64_decode(key, sizeof(key), &n, reinterpret_cast<const uint8_t*>(rest.c_str()),
+                              rest.length()) != 0 ||
+        !Auth::setKey(key, n)) {
+      serialReply("ERR expected base64 of a 32-byte key");
+      return;
+    }
+    memset(key, 0, sizeof(key));
+    clearSubscribers();  // unauthenticated subscribers must re-subscribe with the key
+    Serial.println("[link] paired");
+    serialReply("OK");
+  } else if (verb == "UNPAIR") {
+    Auth::clearKey();
+    clearSubscribers();
+    Serial.println("[link] unpaired");
+    serialReply("OK");
   } else if (verb == "DELICON") {
     const int pos = rest.toInt();
     IconStore::remove(pos);
@@ -323,6 +428,7 @@ String infoJson() {
   doc["date_fmt"] = s.dateFmt;
   doc["time"] = static_cast<uint32_t>(time(nullptr));
   doc["pc_connected"] = pcConnected();
+  doc["paired"] = Auth::paired();
   JsonArray icons = doc["icons"].to<JsonArray>();
   JsonArray labels = doc["labels"].to<JsonArray>();
   for (int i = 0; i < Deck::kButtons; ++i) {

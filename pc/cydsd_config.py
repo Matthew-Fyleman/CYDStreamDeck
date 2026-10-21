@@ -221,8 +221,13 @@ class ConfigApp(tk.Tk):
         ttk.Button(dev, text="Set WiFi...", command=self.set_wifi).grid(row=0, column=8, padx=4)
         ttk.Checkbutton(dev, text="Daemon also listens on USB serial", variable=self.daemon_serial,
                         command=self.mark_dirty).grid(row=1, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4))
+        self.pair_status = tk.StringVar()
+        ttk.Label(dev, textvariable=self.pair_status).grid(row=1, column=4, columnspan=3, sticky="w", padx=(12, 4))
+        ttk.Button(dev, text="Pair over USB...", command=self.pair).grid(row=1, column=7, padx=(12, 4), pady=(0, 4))
         for v in (self.dev_id, self.dev_ip, self.transport):
             v.trace_add("write", lambda *_: self.mark_dirty())
+        self.dev_id.trace_add("write", lambda *_: self.update_pair_status())
+        self.update_pair_status()
 
         mid = ttk.Frame(self)
         mid.pack(fill="both", expand=True, padx=10, pady=4)
@@ -576,7 +581,41 @@ class ConfigApp(tk.Tk):
             return common.DeviceClient("serial", port=self.serial_port)
         if not dev.get("ip"):
             raise RuntimeError("No device IP address. Use 'Find device' or switch to USB serial.")
-        return common.DeviceClient("wifi", ip=dev["ip"])
+        return common.DeviceClient("wifi", ip=dev["ip"], key=common.load_key(dev.get("id", "")))
+
+    def update_pair_status(self):
+        paired = common.load_key(self.dev_id.get().strip()) is not None
+        self.pair_status.set("Paired: WiFi is authenticated" if paired else "Not paired: WiFi is unauthenticated")
+
+    def pair(self):
+        self.collect()
+        if not messagebox.askokcancel(
+                "Pair over USB",
+                "Pair this PC with the deck? The deck must be plugged in by USB.\n\n"
+                "Afterwards the deck only accepts signed WiFi messages, so only paired PCs can "
+                "configure it or receive its presses over WiFi. USB keeps working without pairing.\n\n"
+                "Pairing again replaces the key, which unpairs any other PC. Holding the time row "
+                "on the deck for 10 s (WiFi reset) also clears the pairing."):
+            return
+
+        def work():
+            if not self.serial_port:
+                self.serial_port = self.resolve_serial_port()
+            key = common.new_key()
+            with common.DeviceClient("serial", port=self.serial_port) as dev:
+                dev_id = dev.info()["id"]
+                dev.pair(key)
+            common.save_key(dev_id, key)
+            return dev_id
+
+        def done(dev_id):
+            if not self.dev_id.get().strip():
+                self.dev_id.set(dev_id)
+                self.save()
+            self.update_pair_status()
+            self.set_status(f"Paired with {dev_id}. The daemon picks up the key automatically.")
+
+        self.run_bg("Pairing over USB", work, done)
 
     def find_device(self):
         self.collect()

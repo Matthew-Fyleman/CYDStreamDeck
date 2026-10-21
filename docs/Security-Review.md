@@ -7,7 +7,14 @@
 | PC software reviewed | `pc/cydsd_common.py`, `pc/cydsd_daemon.py`, `pc/cydsd_config.py` |
 | Scope | Two-way communication between the Windows PC and the CYD over a home broadband network (WiFi/LAN), plus the first-boot setup portal. USB serial is covered briefly. |
 
-> **Status (firmware 1.1.0, 2026-10-21):** the quick wins from §4 are implemented: 4.1 (the `Host` check, the `X-CYDSD` header, no `Origin`, a JSON content type, and no CORS header), 4.2, 4.3 and 4.4. The exception in 4.4 is binding to the LAN interface; source-address filtering is used instead. Sections 4.5–4.7 are user setup, and they are now documented in the FSD §6 and the README. Sections 5 (pairing and HMAC) and 6 (setup AP) are still open. Test results are in FSD §8.1.
+> **Status (firmware 1.1.0, 2026-10-21):** the quick wins from §4 are implemented: 4.1 (the `Host` check, the `X-CYDSD` header, no `Origin`, a JSON content type, and no CORS header), 4.2, 4.3 and 4.4. The exception in 4.4 is binding to the LAN interface; source-address filtering is used instead. Sections 4.5–4.7 are user setup, and they are now documented in the FSD §6 and the README. Test results are in FSD §8.1.
+>
+> **Status (firmware 1.2.0):** §5.1–5.3 (pairing and HMAC) are implemented, closing F3, F5 and F9 for a paired deck. Some details differ from the plan:
+> * Pairing is over USB only.
+> * HTTP uses a single-use challenge from the device, so no clock is needed.
+> * PRESS carries a deck boot ID as well as the daemon nonce.
+>
+> Still open: §5.4 (WiFi password in transit, F6; use USB for **Set WiFi...** meanwhile) and §6 (setup AP, F7). Test results are in FSD §8.3.
 
 ## 1. Summary
 

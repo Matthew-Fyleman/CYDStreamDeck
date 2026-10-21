@@ -4,7 +4,7 @@
 |---|---|
 | Version | 1.1 |
 | Date | 2026-10-21 |
-| Firmware version | 1.1.1 |
+| Firmware version | 1.2.0 |
 | Repository | https://github.com/Matthew-Fyleman/CYDStreamDeck |
 
 ## 1. Purpose
@@ -99,7 +99,7 @@ x: 42                                                      438
 | Touch inside an icon | The press is sent to the PC immediately, on touch-down. The bevel flips to **sunken** (light on the bottom and right) with a bright face, and the face turns **green** when the PC acknowledges the press. The button returns to its raised state after 300 ms. The highlight is never sticky. |
 | Touch in a gap or margin | Ignored |
 | Tap in the status row | Shows `IP a.b.c.d   CYDSD-XXXXXX` for 10 s |
-| Hold the status row for 10 s | After 3 s a countdown appears. At 10 s the stored WiFi credentials are erased and the device restarts into the setup portal. This is the recovery path if the WiFi changes. |
+| Hold the status row for 10 s | After 3 s a countdown appears. At 10 s the stored WiFi credentials and the PC pairing key are erased and the device restarts into the setup portal. This is the recovery path if the WiFi changes. |
 
 A new press is only accepted after the finger has been lifted, so holding does not auto-repeat.
 
@@ -131,6 +131,7 @@ Everything is kept in `%APPDATA%\CYDStreamDeck\`:
 | `icons\` | Copies of the chosen image files (`NN_<original name>`) |
 | `daemon.log` | Daemon log, rotated at 512 kB |
 | `pause_serial` | Transient flag that tells the daemon to release the COM port while the configuration application uses it |
+| `keys.json` | Pairing keys per device ID, each encrypted with Windows DPAPI (§5.4) |
 
 Example `config.json`:
 
@@ -190,6 +191,7 @@ A Tkinter window with the following sections:
   * Upload transport: WiFi or USB serial.
   * **Find device**: UDP discovery, falling back to probing the COM ports.
   * **Set WiFi...**: sends new credentials to the deck over WiFi or USB, and the deck restarts. Over WiFi, someone must tap **Yes** on the deck's screen within 30 s to accept the change.
+  * **Pair over USB...** (§5.4), with a status label showing whether this PC holds a key for the deck.
   * A checkbox that controls whether the daemon also listens on USB.
 * **Buttons:** a 3×4 grid mirroring the deck, with thumbnails and labels. Selecting a cell lets you edit:
   * the **label**
@@ -222,6 +224,19 @@ Messages are ASCII, one per datagram, and every message starts with `CYDSD `.
 | PC → device | `CYDSD SUBSCRIBE <id or *>` | `CYDSD SUBSCRIBED <id>`. The sender is registered for presses (max 4 subscribers, 60 s TTL). |
 | device → PC | `CYDSD PRESS <id> <pos> <seq>` | PC replies `CYDSD ACK <seq>` |
 
+#### 5.1.1 Authenticated UDP (once paired, §5.4)
+
+When the deck is paired, it answers `DISCOVER` as before but silently ignores every other unsigned UDP message. A signed message ends with ` <mac>`, where `mac` is the first 16 bytes of HMAC-SHA256(key, everything before ` <mac>`), written as hex.
+
+| Direction | Message | Checks |
+|---|---|---|
+| PC → device | `CYDSD SUBSCRIBE <id> <nonce> <ts> <mac>` | `nonce`: 16 hex characters, chosen at random each time the daemon starts. `ts`: Unix time, strictly increasing per nonce. Once the deck has NTP time, `ts` must also be within ±120 s of it. A replayed SUBSCRIBE is ignored. |
+| device → PC | `CYDSD SUBSCRIBED <id> <nonce> <ts> <boot> <mac>` | Echoes the nonce and `ts`. `boot`: 8 hex characters, random on each deck boot. The daemon accepts it only for a `ts` it sent recently. |
+| device → PC | `CYDSD PRESS <id> <pos> <seq> <nonce> <boot> <mac>` | Signed separately for each subscriber. The daemon requires its own nonce and the current boot. It ACKs every valid copy, but only runs the actions for a `seq` higher than any seen so far in this boot. |
+| PC → device | `CYDSD ACK <seq> <boot> <nonce> <mac>` | Only turns the button green if the boot and the subscriber nonce match |
+
+Together, the nonce and boot ID mean a press captured earlier cannot be replayed, whether from an earlier daemon run or an earlier deck boot. The USB serial copy of a press stays unsigned.
+
 ### 5.2 USB serial (115200 8N1, newline-terminated lines)
 
 Debug output never starts with `CYDSD `, so the PC ignores it. The serial link supports the UDP messages above plus the following:
@@ -235,6 +250,10 @@ Debug output never starts with `CYDSD `, so the PC ignores it. The serial link s
 | `CYDSD WIFI {"ssid":..,"pass":..}` | `CYDSD OK`, then the device restarts. No on-screen confirmation is needed, because USB already implies physical access. |
 | `CYDSD ICON <pos>` / `CYDSD DATA <base64 ≤768 bytes>` … / `CYDSD END` | `CYDSD OK` after each line, which provides flow control |
 | `CYDSD DELICON <pos>` | `CYDSD OK` |
+| `CYDSD PAIR <base64 of a 32-byte key>` | `CYDSD OK`. Stores the key in NVS (namespace `pair`) and clears the current subscribers. |
+| `CYDSD UNPAIR` | `CYDSD OK`. Removes the key, and the deck goes back to the unauthenticated protocol. |
+
+Serial is never authenticated, because USB already implies physical access.
 
 ### 5.3 HTTP API (port 80, station mode)
 
@@ -244,16 +263,29 @@ Request rules (anything else gets `403 {"ok":false,"error":"forbidden"}`):
 * Every `POST` must carry `X-CYDSD: 1` and **no** `Origin` header. Browsers always send `Origin` on cross-site POSTs and cannot add a custom header without a CORS preflight, which the device never approves. Web pages therefore cannot drive the API.
 * The JSON endpoints require `Content-Type: application/json` (otherwise 400).
 * No CORS headers are sent.
+* **Once paired:** every `/api/` request except `/api/challenge` must also carry `X-CYDSD-Auth: <challenge> <mac>`, or it gets `401`. To build it:
+  * Fetch a challenge from `GET /api/challenge`. It can be used once and is valid for 60 s, and the deck holds at most 4 at a time.
+  * Compute `mac = HMAC(key, "CYDSD-HTTP <GET|POST> <path> <pos or -> <challenge> <sha256 hex of body>")`. For `/api/icon`, the body hash is over the 14,112 icon bytes rather than the multipart body. The deck hashes the bytes as they stream in, and only replaces the icon if the MAC matches.
+  * A captured request cannot be replayed, and changing its body or `pos` breaks the MAC.
 
 | Method and path | Body | Notes |
 |---|---|---|
-| `GET /` | – | Status page |
-| `GET /api/info` | – | id, name, fw, ip, ssid, rssi, icon_size, rows, cols, tz, formats, time, pc_connected, icons[12], labels[12] |
+| `GET /` | – | Status page (never needs authentication) |
+| `GET /api/challenge` | – | `{"challenge": "<32 hex>"}` |
+| `GET /api/info` | – | id, name, fw, ip, ssid, rssi, icon_size, rows, cols, tz, formats, time, pc_connected, paired, icons[12], labels[12] |
 | `POST /api/settings` | JSON `{tz, time_fmt, date_fmt, name, labels[12]}` | All fields are optional. The values are validated, saved, and the screen is redrawn. |
 | `POST /api/icon?pos=N` | multipart file (14,112 bytes, 84×84 RGB565 BE) | |
 | `POST /api/icon/delete?pos=N` | – | |
 | `POST /api/wifi` | JSON `{ssid, pass}` | The deck asks "Change WiFi?" on screen. **Yes** within 30 s saves the credentials and restarts; **No** or a timeout returns `403 declined on the deck`. The request blocks while the question is shown. |
 | `POST /api/press?pos=N` | – | Simulates a touch on position N. **Only in builds with `-D CYDSD_DEBUG_API`**; otherwise 404. |
+
+### 5.4 Pairing
+
+* **Pair over USB...** in the configuration application generates a random 32-byte key, sends it with `CYDSD PAIR` over USB, and saves it in `%APPDATA%\CYDStreamDeck\keys.json`. The key is stored per device ID and encrypted with Windows DPAPI, so only the same Windows user can read it. The key never crosses the network.
+* The daemon reloads `keys.json` when it changes. While it has a key for the configured device ID, it uses the authenticated protocol (§5.1.1) and ignores unsigned WiFi messages.
+* Pairing again replaces the key, which unpairs any other PC. Each PC that should work over WiFi needs the same key, so for now only one PC can be paired.
+* The 10-second hold on the status row (WiFi reset) also clears the pairing, as does `CYDSD UNPAIR`.
+* An unpaired deck behaves exactly as in firmware 1.1.
 
 ## 6. Security considerations
 
@@ -262,11 +294,12 @@ The full review and improvement plan is in [Security-Review.md](Security-Review.
 | Party | Trusted? | Protection |
 |---|---|---|
 | Web pages in a browser on the LAN | **No** | HTTP request rules in §5.3: `Host` check, `X-CYDSD` header, no `Origin`, no CORS |
-| Other devices on the home LAN | **No**, but only partly protected until message authentication is added | The daemon only accepts datagrams from the deck's address and rate-limits presses. WiFi changes need a tap on the deck. Spoofing the deck's IP address is still possible on the LAN. |
-| Someone with physical access (USB, the touchscreen, the flash chip) | Yes | – |
+| Other devices on the home LAN | **No** | **When paired** (§5.4): every WiFi message except discovery is authenticated with HMAC and protected against replay. **When unpaired**: the daemon only accepts the deck's address and rate-limits presses, but a LAN host can still spoof that address or change settings. In both cases WiFi changes need a tap on the deck. |
+| Someone with physical access (USB, the touchscreen, the flash chip) | Yes | USB is unauthenticated. The pairing key and WiFi password are in unencrypted flash. |
 
 * A press can only trigger actions that the PC owner has configured. The device never sends commands or paths to the PC, only a grid position, so a rogue device or spoofed packet can at most run one of the user's own configured actions.
-* Settings, icons and labels can still be changed by a LAN host that sends the right headers. The UDP subscription can also be abused by LAN hosts (Security-Review F5).
+* **Pair the deck.** Until it is paired, a LAN host can change settings, icons and labels, and can abuse the UDP subscription (Security-Review F5).
+* Messages are authenticated but not encrypted. A LAN host that can sniff traffic can still see button presses, labels and, when **Set WiFi...** is used over WiFi, the WiFi password. Set the WiFi over USB to avoid that (Security-Review step 8).
 * The setup access point is open. It exists only until credentials are verified, and it is shown on the device screen while active.
 * Nothing needs to be reachable from the internet. **Do not port-forward** ports 80, 47800 or 47801 on the router. Give the deck a **DHCP reservation**, so the daemon's trusted address stays correct.
 * **Windows Firewall:** decline the program-wide "allow Python" prompt, or delete the rule it created, and add a scoped rule instead (run as administrator, adjusting the IP and path):
@@ -333,3 +366,22 @@ The test used a debug build (`-D CYDSD_DEBUG_API`) that adds the serial command 
 | Deck failed to join WiFi at boot after flashing | Seen during testing. The watchdog's first retry at 30 s connected it. |
 | Restart after 5 minutes offline | Not tested, because it needs the network to be unavailable for more than 5 minutes |
 | Release build re-flashed | Online at 192.168.1.198, firmware 1.1.1 |
+
+### 8.3 Pairing and HMAC authentication, firmware 1.2.0 (2026-10-21)
+
+| Test | Result |
+|---|---|
+| Firmware compile, upload; unpaired deck still works over unauthenticated WiFi | Passed. RAM 14.9 %, flash 44.7 %. |
+| Pairing over USB (the steps behind **Pair over USB...**); key protected with DPAPI and read back | Passed. The deck reports `paired: true`. |
+| HTTP: unsigned request, or signed with the wrong key | 401 |
+| HTTP: signed info, settings and icon upload | 200; an icon upload takes 0.6 s |
+| HTTP: replayed request (challenge reused), body changed, or `pos` changed | 401 |
+| HTTP: icon upload whose MAC covers other bytes | 401; the existing icon is kept |
+| Deck UDP: `DISCOVER` while paired | Answered |
+| Deck UDP: unsigned SUBSCRIBE, wrong key, replayed SUBSCRIBE, `ts` 10 min old | Ignored |
+| Deck UDP: signed SUBSCRIBE | Signed SUBSCRIBED echoing the nonce and `ts` |
+| Daemon against a simulated paired deck: signed SUBSCRIBE; valid press gets a signed ACK and runs | Passed |
+| Daemon: replayed seq (after the de-duplication window), earlier boot, another daemon's nonce, wrong key, unsigned press | Not run (no ACK for the last four) |
+| Daemon: forged boot change through a SUBSCRIBED with a stale `ts` | Ignored |
+| Real daemon with the paired deck | "Subscribed … (authenticated, deck boot …)" |
+| Configuration application: shows "Paired" and uses the key for WiFi uploads | Passed |

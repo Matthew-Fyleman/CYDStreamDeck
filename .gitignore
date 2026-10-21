@@ -225,3 +225,6 @@ __marimo__/
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local icon images (third-party logos), not distributed
+pc/icons/

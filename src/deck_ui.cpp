@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <time.h>
 
+#include "auth.h"
 #include "deck_config.h"
 #include "icon_store.h"
 #include "link.h"
@@ -214,8 +215,10 @@ void handleTouch() {
       if (held > 3000) gHoldCountdown = true;
       if (held >= Deck::kWifiResetHoldMs) {
         DeckUI::showMessage("WiFi reset",
-                            "Stored WiFi credentials cleared.\nRestarting into setup mode...");
+                            "Stored WiFi credentials and PC pairing cleared.\n"
+                            "Restarting into setup mode...");
         Settings::clearWifi();
+        Auth::clearKey();
         delay(1500);
         ESP.restart();
       }

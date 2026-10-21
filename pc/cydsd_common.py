@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
+import secrets
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -29,6 +33,8 @@ LOG_PATH = APP_DIR / "daemon.log"
 # While this file exists the daemon releases the serial port (used by the
 # configuration app to upload over USB).
 PAUSE_SERIAL_FLAG = APP_DIR / "pause_serial"
+# Pairing keys per device id, each protected with Windows DPAPI (current user).
+KEYS_PATH = APP_DIR / "keys.json"
 
 # ---------------------------------------------------------------------------
 # Device constants (must match include/deck_config.h)
@@ -288,6 +294,92 @@ def udp_discover(timeout: float = 1.5, extra_ips: list[str] | None = None) -> li
 
 
 # ---------------------------------------------------------------------------
+# Pairing keys and message authentication (must match src/auth.cpp)
+# ---------------------------------------------------------------------------
+
+KEY_BYTES = 32
+MAC_HEX_LEN = 32
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    """Encrypt/decrypt with Windows DPAPI so only this Windows user can read the key."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = Blob()
+    crypt32 = ctypes.windll.crypt32
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)):
+        raise OSError("DPAPI " + ("protect" if protect else "unprotect") + " failed")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+
+
+def _load_keys() -> dict:
+    try:
+        with open(KEYS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def load_key(device_id: str) -> bytes | None:
+    """The pairing key for a deck, or None if this PC is not paired with it."""
+    blob = _load_keys().get(device_id.upper()) if device_id else None
+    if not blob:
+        return None
+    try:
+        key = _dpapi(base64.b64decode(blob), protect=False)
+    except (OSError, ValueError):
+        return None
+    return key if len(key) == KEY_BYTES else None
+
+
+def save_key(device_id: str, key: bytes) -> None:
+    ensure_dirs()
+    keys = _load_keys()
+    keys[device_id.upper()] = base64.b64encode(_dpapi(key, protect=True)).decode()
+    tmp = KEYS_PATH.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(keys, f, indent=2)
+    os.replace(tmp, KEYS_PATH)
+
+
+def delete_key(device_id: str) -> None:
+    keys = _load_keys()
+    if keys.pop(device_id.upper(), None) is not None:
+        with open(KEYS_PATH, "w", encoding="utf-8") as f:
+            json.dump(keys, f, indent=2)
+
+
+def new_key() -> bytes:
+    return secrets.token_bytes(KEY_BYTES)
+
+
+def mac(key: bytes, text: str) -> str:
+    return hmac.new(key, text.encode(), hashlib.sha256).hexdigest()[:MAC_HEX_LEN]
+
+
+def sign(key: bytes, text: str) -> str:
+    return f"{text} {mac(key, text)}"
+
+
+def verify_signed(key: bytes, line: str) -> str | None:
+    """Returns the signed text of "<text> <mac>" if the MAC is valid, else None."""
+    text, _, tag = line.rpartition(" ")
+    if not text or len(tag) != MAC_HEX_LEN:
+        return None
+    return text if hmac.compare_digest(mac(key, text), tag.lower()) else None
+
+
+# ---------------------------------------------------------------------------
 # USB serial
 # ---------------------------------------------------------------------------
 
@@ -382,10 +474,11 @@ class SerialSession:
 
 
 class DeviceClient:
-    def __init__(self, transport: str, ip: str = "", port: str = ""):
+    def __init__(self, transport: str, ip: str = "", port: str = "", key: bytes | None = None):
         self.transport = transport
         self.ip = ip
         self.port = port
+        self.key = key  # pairing key; HTTP requests are signed when set
         self.session: SerialSession | None = None
 
     # -- context management: pauses the daemon's serial use if needed --
@@ -409,14 +502,27 @@ class DeviceClient:
             PAUSE_SERIAL_FLAG.unlink(missing_ok=True)
 
     # -- HTTP helpers --
+    def _auth_header(self, method: str, path: str, body_sha: str) -> str:
+        """X-CYDSD-Auth value for a paired deck (see authorized() in api_server.cpp)."""
+        challenge = self._http("/api/challenge", sign_request=False)["challenge"]
+        uri, _, query = path.partition("?")
+        params = urllib.parse.parse_qs(query)
+        pos = params.get("pos", ["-"])[0]
+        return f"{challenge} {mac(self.key, f'CYDSD-HTTP {method} {uri} {pos} {challenge} {body_sha}')}"
+
     def _http(self, path: str, body: bytes | None = None, content_type: str = "application/json",
-              timeout: float = 10) -> dict:
-        req = urllib.request.Request(f"http://{self.ip}{path}", data=body, method="POST" if body is not None else "GET")
+              timeout: float = 10, body_sha: str | None = None, sign_request: bool = True) -> dict:
+        method = "POST" if body is not None else "GET"
+        req = urllib.request.Request(f"http://{self.ip}{path}", data=body, method=method)
         # The deck rejects POSTs without this header, which a web page cannot add
         # to a cross-site request.
         req.add_header("X-CYDSD", "1")
         if body is not None:
             req.add_header("Content-Type", content_type)
+        if self.key and sign_request:
+            if body_sha is None:
+                body_sha = hashlib.sha256(body or b"").hexdigest()
+            req.add_header("X-CYDSD-Auth", self._auth_header(method, path, body_sha))
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode() or "{}")
@@ -453,13 +559,21 @@ class DeviceClient:
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"icon\"; filename=\"{pos}.bin\"\r\n"
             "Content-Type: application/octet-stream\r\n\r\n"
         ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
-        self._http(f"/api/icon?pos={pos}", body, f"multipart/form-data; boundary={boundary}")
+        # The deck hashes the file bytes as they stream in, not the multipart body.
+        self._http(f"/api/icon?pos={pos}", body, f"multipart/form-data; boundary={boundary}",
+                   body_sha=hashlib.sha256(data).hexdigest())
 
     def delete_icon(self, pos: int) -> None:
         if self.transport == "serial":
             self.session.command(f"DELICON {pos}")
         else:
             self._http(f"/api/icon/delete?pos={pos}", b"")
+
+    def pair(self, key: bytes) -> None:
+        """Store a pairing key on the deck. USB only: the key never crosses the network."""
+        if self.transport != "serial":
+            raise RuntimeError("Pairing is only possible over USB")
+        self.session.command("PAIR " + base64.b64encode(key).decode())
 
     def set_wifi(self, ssid: str, password: str) -> None:
         payload = json.dumps({"ssid": ssid, "pass": password})

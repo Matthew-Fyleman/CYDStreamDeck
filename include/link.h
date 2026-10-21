@@ -19,8 +19,17 @@
 //   CYDSD DATA <base64>            -> CYDSD OK   (icon bytes)
 //   CYDSD END                      -> CYDSD OK | CYDSD ERR <msg>
 //   CYDSD DELICON <pos>            -> CYDSD OK
+//   CYDSD PAIR <base64 key>        -> CYDSD OK   (32-byte key; turns on authentication)
+//   CYDSD UNPAIR                   -> CYDSD OK
 // Device -> PC:
 //   CYDSD PRESS <id> <pos> <seq>   (UDP to every subscriber, and on serial)
+//
+// Once paired, everything on UDP except DISCOVER must be signed (see auth.h):
+//   CYDSD SUBSCRIBE <id> <nonce> <ts> <mac>
+//     -> CYDSD SUBSCRIBED <id> <nonce> <ts> <boot> <mac>
+//   CYDSD PRESS <id> <pos> <seq> <nonce> <boot> <mac>   (one per subscriber)
+//   CYDSD ACK <seq> <boot> <nonce> <mac>
+// Serial stays unsigned: USB already implies physical access.
 namespace Link {
 
 // pos is the changed icon, or -1 when settings changed.

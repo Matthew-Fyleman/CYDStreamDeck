@@ -225,6 +225,12 @@ void handleSerialLine(const String& line) {
     IconStore::remove(pos);
     serialReply("OK");
     notify(pos);
+#ifdef CYDSD_DEBUG_API
+  } else if (verb == "DROPWIFI") {
+    // Leaves the network without auto-reconnect, to exercise the WiFi watchdog.
+    WiFi.disconnect(false, false);
+    serialReply("OK");
+#endif
   } else {
     serialReply("ERR unknown command");
   }

@@ -4,7 +4,7 @@
 |---|---|
 | Version | 1.1 |
 | Date | 2026-10-21 |
-| Firmware version | 1.1.0 |
+| Firmware version | 1.1.1 |
 | Repository | https://github.com/Matthew-Fyleman/CYDStreamDeck |
 
 ## 1. Purpose
@@ -44,6 +44,7 @@ The hardware details below come from the `Clocky` project (`..\Clocky`), which r
 2. Load settings from NVS and mount LittleFS (the icon store).
 3. **If no WiFi credentials are stored**, start the setup portal (§3.2).
 4. **Otherwise**, connect to the stored network in station mode with auto-reconnect, draw the button grid, and start the UDP link (§5.1), the HTTP API (§5.3) and NTP time sync once connected.
+5. **WiFi watchdog:** the core's auto-reconnect can give up for good, for example after the router restarts or changes the DHCP lease. So while the deck is offline (including straight after boot), the firmware restarts the WiFi connection every 30 s. After 5 minutes offline it restarts the device, unless an icon upload is in progress. Serial and touch keep working throughout, so presses still reach the PC over USB.
 
 ### 3.2 WiFi setup portal (first boot)
 
@@ -321,3 +322,14 @@ pythonw cydsd_daemon.py         # or tick "Start daemon when I sign in to Window
 | Daemon: forged `PRESS` from an address other than the deck's | Passed: no ACK, no action, one log line |
 | Daemon: 50 presses in a burst | Passed: 4 ran, the rest were dropped |
 | Daemon: a position pressed again while its actions are still running | Passed: not queued twice |
+
+### 8.2 WiFi watchdog, firmware 1.1.1 (2026-10-21)
+
+The test used a debug build (`-D CYDSD_DEBUG_API`) that adds the serial command `CYDSD DROPWIFI`. That command leaves the network without auto-reconnect.
+
+| Test | Result |
+|---|---|
+| Deck disconnected with `DROPWIFI` | Auto-reconnect did nothing. After 30 s the watchdog reconnected the deck in 0.2 s. HTTP and UDP discovery then worked with the same sockets. |
+| Deck failed to join WiFi at boot after flashing | Seen during testing. The watchdog's first retry at 30 s connected it. |
+| Restart after 5 minutes offline | Not tested, because it needs the network to be unavailable for more than 5 minutes |
+| Release build re-flashed | Online at 192.168.1.198, firmware 1.1.1 |

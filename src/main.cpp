@@ -24,6 +24,8 @@ XPT2046_Touchscreen touch(Pins::kTouchCs, Pins::kTouchIrq);
 namespace {
 
 bool gOnline = false;
+uint32_t gOfflineSince = 0;  // millis() when the connection was lost (or boot)
+uint32_t gLastKick = 0;
 
 void onPress(int pos) { Link::sendPress(pos); }
 
@@ -62,14 +64,36 @@ void onWifiUp() {
   DeckUI::redrawStatus();
 }
 
+// The core's auto-reconnect can give up for good, e.g. after the router
+// restarts or changes the DHCP lease, so this watchdog restarts the
+// connection itself and, as a last resort, the whole device.
 void checkWifi() {
   const bool up = WiFi.isConnected();
-  if (up && !gOnline) {
-    gOnline = true;
-    onWifiUp();
-  } else if (!up && gOnline) {
+  const uint32_t now = millis();
+  if (up) {
+    if (!gOnline) {
+      gOnline = true;
+      onWifiUp();
+    }
+    return;
+  }
+  if (gOnline) {
     gOnline = false;
+    gOfflineSince = now;
+    gLastKick = now;
     Serial.println("[wifi] connection lost, auto-reconnecting");
+  }
+  const uint32_t offline = now - gOfflineSince;
+  if (offline >= Deck::kWifiRestartMs && IconStore::writingPos() < 0) {
+    Serial.printf("[wifi] offline for %lu s, restarting\n", static_cast<unsigned long>(offline / 1000));
+    Serial.flush();
+    ESP.restart();
+  }
+  if (now - gLastKick >= Deck::kWifiKickMs) {
+    gLastKick = now;
+    Serial.printf("[wifi] still offline after %lu s, reconnecting\n", static_cast<unsigned long>(offline / 1000));
+    WiFi.disconnect(false, false);
+    WiFi.begin(Settings::wifiSsid().c_str(), Settings::wifiPass().c_str());
   }
 }
 

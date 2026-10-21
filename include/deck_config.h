@@ -5,7 +5,7 @@
 // Compile-time constants shared by all firmware modules.
 namespace Deck {
 
-constexpr const char* kFirmwareVersion = "1.1.0";
+constexpr const char* kFirmwareVersion = "1.1.1";
 
 // Display geometry (landscape, setRotation(1)).
 constexpr int16_t kScreenW = 480;
@@ -43,5 +43,7 @@ constexpr uint32_t kPressFlashMs = 300;
 constexpr uint32_t kIpShowMs = 10000;
 constexpr uint32_t kWifiResetHoldMs = 10000;
 constexpr uint32_t kSubscriberTtlMs = 60000;
+constexpr uint32_t kWifiKickMs = 30000;      // restart the WiFi connection this often while offline
+constexpr uint32_t kWifiRestartMs = 300000;  // restart the device after this long offline
 
 }  // namespace Deck

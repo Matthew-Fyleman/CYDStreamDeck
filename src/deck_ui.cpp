@@ -25,14 +25,17 @@ constexpr uint16_t kStatusText = TFT_WHITE;
 constexpr uint16_t kLinkOk = 0x07E8;
 constexpr uint16_t kLinkOff = 0x528A;
 
-// Bevel palettes: highlight edge, shadow edge, bevel face.
+// Bevel palettes: highlight edge, shadow edge, bevel face. The shadow must
+// stay clearly distinct from the black background, otherwise the bottom/right
+// border looks thinner than the top/left one and the image appears off-centre.
 enum class Face { Normal, Pressed, Acked };
 struct BevelColors {
   uint16_t light, dark, face;
 };
-constexpr BevelColors kBevelNormal = {0x9CF3, 0x10A2, 0x4A6B};   // slate, raised
-constexpr BevelColors kBevelPressed = {0xFFFF, 0x4208, 0xBDF7};  // bright, sunken
-constexpr BevelColors kBevelAcked = {0x9FF3, 0x01E0, 0x0600};    // green, sunken
+constexpr BevelColors kBevelNormal = {0xA534, 0x3186, 0x5AEE};   // slate, raised
+constexpr BevelColors kBevelPressed = {0xFFFF, 0x6B4D, 0xBDF7};  // bright, sunken
+constexpr BevelColors kBevelAcked = {0x9FF3, 0x0300, 0x0600};    // green, sunken
+constexpr uint16_t kRecessLine = 0x0841;  // uniform outline around the image
 constexpr int16_t kOuterRadius = 12;
 constexpr int16_t kEdge = 2;  // width of the highlight/shadow edges
 
@@ -105,7 +108,8 @@ void drawPlaceholder(int pos, int16_t ix, int16_t iy) {
 
 // Rounded pseudo-3D bevel filling exactly the icon cell, so the gaps between
 // icons are untouched. Raised when idle (light top-left, shadow bottom-right),
-// sunken while pressed. The image recess inside gets an inset outline.
+// sunken while pressed. The image recess gets a uniform dark outline so the
+// visible border is the same width on all four sides.
 void drawBevel(int16_t x, int16_t y, Face face) {
   TFT_eSPI& tft = *gTft;
   const BevelColors& c = face == Face::Normal ? kBevelNormal
@@ -120,14 +124,8 @@ void drawBevel(int16_t x, int16_t y, Face face) {
   tft.fillSmoothRoundRect(x + kEdge, y + kEdge, s - 2 * kEdge, s - 2 * kEdge, kOuterRadius - kEdge,
                           c.face, topLeft);
 
-  // Recess outline: shadowed on the top-left, lit on the bottom-right.
-  const int16_t r0 = Deck::kBevel - 1;
-  const int16_t r1 = Deck::kBevel + Deck::kImageSize;
-  const int16_t len = Deck::kImageSize + 2;
-  tft.drawFastHLine(x + r0, y + r0, len, bottomRight);
-  tft.drawFastVLine(x + r0, y + r0, len, bottomRight);
-  tft.drawFastHLine(x + r0, y + r1, len, topLeft);
-  tft.drawFastVLine(x + r1, y + r0, len, topLeft);
+  tft.drawRect(x + Deck::kBevel - 1, y + Deck::kBevel - 1, Deck::kImageSize + 2, Deck::kImageSize + 2,
+               kRecessLine);
 }
 
 void drawIcon(int pos, Face face) {

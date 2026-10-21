@@ -84,7 +84,7 @@ x: 42                                                      438
   * an anti-aliased outer edge with a 12 px corner radius
   * a 2 px light edge on the top and left, and a 2 px shadow edge on the bottom and right (a raised look)
   * a slate face
-  * an inset outline around the image recess
+  * a uniform 1 px dark outline around the image recess, so the border looks the same width on all four sides
 * The icon image sits in an **84×84 px** recess inside the 6 px bevel.
 * Each position has an index from 0 to 11, counted row by row (`pos = row*4 + col`).
 * An icon with no image is drawn as a rounded tile showing its label, wrapped onto up to two lines, or its "row,col" if it has no label.

@@ -5,6 +5,7 @@
 #include <WiFi.h>
 
 #include "deck_config.h"
+#include "deck_ui.h"
 #include "icon_store.h"
 #include "link.h"
 #include "settings.h"
@@ -17,10 +18,9 @@ ApiServer::PressHandler gOnPress = nullptr;
 bool gStarted = false;
 bool gUploadOk = false;
 
-void sendJson(int code, const String& body) {
-  gServer.sendHeader("Access-Control-Allow-Origin", "*");
-  gServer.send(code, "application/json", body);
-}
+// No CORS headers: the configuration app is not a browser, and web pages must
+// not be able to read or drive the API.
+void sendJson(int code, const String& body) { gServer.send(code, "application/json", body); }
 
 void sendResult(bool ok, const String& err = "") {
   if (ok) {
@@ -35,6 +35,31 @@ void sendResult(bool ok, const String& err = "") {
   }
 }
 
+// Rejects requests that did not come from the configuration app:
+//  * Host must name this device, which defeats DNS rebinding.
+//  * POSTs must carry X-CYDSD: 1 and no Origin. Browsers always send Origin on
+//    cross-site POSTs and cannot add a custom header without a CORS preflight,
+//    which this server never approves.
+bool requestAllowed() {
+  String host = gServer.hostHeader();
+  if (host.endsWith(":80")) host.remove(host.length() - 3);
+  const bool hostOk = host == WiFi.localIP().toString() ||
+                      host.equalsIgnoreCase(Settings::deviceId()) ||
+                      host.equalsIgnoreCase(Settings::deviceId() + ".local");
+  if (!hostOk) return false;
+  if (gServer.method() != HTTP_POST) return true;
+  return !gServer.hasHeader("Origin") && gServer.header("X-CYDSD") == "1";
+}
+
+bool isJsonRequest() { return gServer.header("Content-Type").startsWith("application/json"); }
+
+// Returns true (after replying 403) if the request must not be handled.
+bool reject() {
+  if (requestAllowed()) return false;
+  sendJson(403, "{\"ok\":false,\"error\":\"forbidden\"}");
+  return true;
+}
+
 int posArg() {
   if (!gServer.hasArg("pos")) return -1;
   const int pos = gServer.arg("pos").toInt();
@@ -42,6 +67,7 @@ int posArg() {
 }
 
 void handleRoot() {
+  if (reject()) return;
   String html =
       "<!doctype html><html><head><meta name=viewport content='width=device-width'>"
       "<title>CYD Stream Deck</title><style>body{font-family:sans-serif;margin:2em;"
@@ -55,6 +81,8 @@ void handleRoot() {
 }
 
 void handleSettings() {
+  if (reject()) return;
+  if (!isJsonRequest()) return sendResult(false, "expected application/json");
   String err;
   const bool ok = Settings::applyJson(gServer.arg("plain"), err);
   sendResult(ok, err);
@@ -64,7 +92,7 @@ void handleSettings() {
 void handleIconUpload() {
   HTTPUpload& up = gServer.upload();
   if (up.status == UPLOAD_FILE_START) {
-    gUploadOk = posArg() >= 0 && IconStore::beginWrite(posArg());
+    gUploadOk = requestAllowed() && posArg() >= 0 && IconStore::beginWrite(posArg());
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (gUploadOk) gUploadOk = IconStore::write(up.buf, up.currentSize);
   } else if (up.status == UPLOAD_FILE_END) {
@@ -76,6 +104,7 @@ void handleIconUpload() {
 }
 
 void handleIconDone() {
+  if (reject()) return;
   const int pos = posArg();
   sendResult(gUploadOk, "icon upload failed (expect " + String(Deck::kIconBytes) + " bytes RGB565)");
   if (gUploadOk && gOnChange) gOnChange(pos);
@@ -83,6 +112,7 @@ void handleIconDone() {
 }
 
 void handleIconDelete() {
+  if (reject()) return;
   const int pos = posArg();
   if (pos < 0) return sendResult(false, "bad pos");
   sendResult(IconStore::remove(pos), "delete failed");
@@ -90,23 +120,42 @@ void handleIconDelete() {
 }
 
 void handleWifi() {
+  if (reject()) return;
   JsonDocument doc;
-  if (deserializeJson(doc, gServer.arg("plain")) || !doc["ssid"].is<const char*>() ||
-      doc["ssid"].as<String>().length() == 0) {
-    return sendResult(false, "expected {ssid, pass}");
+  if (!isJsonRequest() || deserializeJson(doc, gServer.arg("plain")) ||
+      !doc["ssid"].is<const char*>() || doc["ssid"].as<String>().length() == 0) {
+    return sendResult(false, "expected application/json {ssid, pass}");
   }
-  Settings::saveWifi(doc["ssid"].as<String>(), doc["pass"] | "");
+  const String ssid = doc["ssid"].as<String>();
+  // Someone must be at the deck to accept a network change.
+  const bool accepted = DeckUI::confirm(
+      "Change WiFi?", "The PC asked this deck to join the network:\n\n    " + ssid +
+                          "\n\nTap Yes to accept. No reply in 30 s means No.");
+  if (!accepted) {
+    DeckUI::redrawAll();
+    JsonDocument err;
+    err["ok"] = false;
+    err["error"] = "declined on the deck";
+    String out;
+    serializeJson(err, out);
+    return sendJson(403, out);
+  }
+  Settings::saveWifi(ssid, doc["pass"] | "");
+  DeckUI::showMessage("WiFi", "Joining " + ssid + "\n\nRestarting...");
   sendResult(true);
   delay(500);
   ESP.restart();
 }
 
+#ifdef CYDSD_DEBUG_API
 void handlePress() {
+  if (reject()) return;
   const int pos = posArg();
   if (pos < 0) return sendResult(false, "bad pos");
   if (gOnPress) gOnPress(pos);
   sendResult(true);
 }
+#endif
 
 }  // namespace
 
@@ -116,13 +165,19 @@ void begin(ChangeHandler onChange, PressHandler onPress) {
   gOnChange = onChange;
   gOnPress = onPress;
   if (gStarted) return;
+  static const char* kHeaders[] = {"Origin", "X-CYDSD", "Content-Type"};
+  gServer.collectHeaders(kHeaders, sizeof(kHeaders) / sizeof(kHeaders[0]));
   gServer.on("/", HTTP_GET, handleRoot);
-  gServer.on("/api/info", HTTP_GET, [] { sendJson(200, Link::infoJson()); });
+  gServer.on("/api/info", HTTP_GET, [] {
+    if (!reject()) sendJson(200, Link::infoJson());
+  });
   gServer.on("/api/settings", HTTP_POST, handleSettings);
   gServer.on("/api/icon", HTTP_POST, handleIconDone, handleIconUpload);
   gServer.on("/api/icon/delete", HTTP_POST, handleIconDelete);
   gServer.on("/api/wifi", HTTP_POST, handleWifi);
-  gServer.on("/api/press", HTTP_POST, handlePress);
+#ifdef CYDSD_DEBUG_API
+  gServer.on("/api/press", HTTP_POST, handlePress);  // simulated touch, for bench testing only
+#endif
   gServer.onNotFound([] { gServer.send(404, "text/plain", "not found"); });
   gServer.begin();
   gStarted = true;

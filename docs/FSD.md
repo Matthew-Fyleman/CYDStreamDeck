@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| Version | 1.0 |
+| Version | 1.1 |
 | Date | 2026-10-21 |
-| Firmware version | 1.0.0 |
+| Firmware version | 1.1.0 |
 | Repository | https://github.com/Matthew-Fyleman/CYDStreamDeck |
 
 ## 1. Purpose
@@ -163,7 +163,9 @@ The actions for a button run in order, in a worker thread. A failing action is l
 
 ### 4.3 Daemon (`cydsd_daemon.py`)
 
-* **WiFi (primary transport):** the daemon binds UDP port 47801. Every 15 s it sends `CYDSD SUBSCRIBE <device id>` to the local broadcast addresses and to the device's last known IP. The device sends presses to every subscriber it has heard from in the last 60 s. The daemon acknowledges each press, and the device retries up to 3 times, 250 ms apart, until it gets an acknowledgement.
+* **WiFi (primary transport):** the daemon binds UDP port 47801. Every 15 s it sends `CYDSD SUBSCRIBE <device id>` to the deck's address. It also sends it to the local broadcast addresses until it knows the deck's address, or when the deck has not replied for 45 s. The device sends presses to every subscriber it has heard from in the last 60 s. The daemon acknowledges each press, and the device retries up to 3 times, 250 ms apart, until it gets an acknowledgement.
+* **Trusted address:** the deck's address is `device.ip` from `config.json`. If that is empty, it is the address of the first deck that answers a `SUBSCRIBE`. Datagrams from any other address are dropped without an ACK, and each such address is logged once. If the deck's address changes, run **Find device** in the configuration application, or better, give the deck a DHCP reservation.
+* **Rate limit:** at most 2 presses per second are accepted, with bursts of up to 4. A position whose actions are still queued or running is not queued again. Actions run on a pool of 2 worker threads.
 * **USB serial (secondary transport, optional, `device.serial`):** the daemon automatically finds the right COM port by sending `CYDSD HELLO` to each port and waiting for a matching `CYDSD ID <id>` reply.
   * Ports that don't answer, such as other CYDs running other firmware, are remembered and only probed again when the list of COM ports changes.
   * Ports are opened with DTR/RTS de-asserted, so probing does not reset ESP32 boards.
@@ -186,7 +188,7 @@ A Tkinter window with the following sections:
   * Device ID and IP address fields.
   * Upload transport: WiFi or USB serial.
   * **Find device**: UDP discovery, falling back to probing the COM ports.
-  * **Set WiFi...**: sends new credentials to the deck over WiFi or USB, and the deck restarts.
+  * **Set WiFi...**: sends new credentials to the deck over WiFi or USB, and the deck restarts. Over WiFi, someone must tap **Yes** on the deck's screen within 30 s to accept the change.
   * A checkbox that controls whether the daemon also listens on USB.
 * **Buttons:** a 3×4 grid mirroring the deck, with thumbnails and labels. Selecting a cell lets you edit:
   * the **label**
@@ -229,11 +231,18 @@ Debug output never starts with `CYDSD `, so the PC ignores it. The serial link s
 | `CYDSD PING` | `CYDSD PONG` |
 | `CYDSD INFO` | `CYDSD INFO <json>` (the same JSON as `/api/info`) |
 | `CYDSD SET <json>` | `CYDSD OK` or `CYDSD ERR <msg>`. The JSON has the same fields as `/api/settings`. |
-| `CYDSD WIFI {"ssid":..,"pass":..}` | `CYDSD OK`, then the device restarts |
+| `CYDSD WIFI {"ssid":..,"pass":..}` | `CYDSD OK`, then the device restarts. No on-screen confirmation is needed, because USB already implies physical access. |
 | `CYDSD ICON <pos>` / `CYDSD DATA <base64 ≤768 bytes>` … / `CYDSD END` | `CYDSD OK` after each line, which provides flow control |
 | `CYDSD DELICON <pos>` | `CYDSD OK` |
 
 ### 5.3 HTTP API (port 80, station mode)
+
+Request rules (anything else gets `403 {"ok":false,"error":"forbidden"}`):
+
+* The `Host` header must be the device's IP address, `CYDSD-XXXXXX` or `CYDSD-XXXXXX.local`. This defeats DNS rebinding.
+* Every `POST` must carry `X-CYDSD: 1` and **no** `Origin` header. Browsers always send `Origin` on cross-site POSTs and cannot add a custom header without a CORS preflight, which the device never approves. Web pages therefore cannot drive the API.
+* The JSON endpoints require `Content-Type: application/json` (otherwise 400).
+* No CORS headers are sent.
 
 | Method and path | Body | Notes |
 |---|---|---|
@@ -242,15 +251,30 @@ Debug output never starts with `CYDSD `, so the PC ignores it. The serial link s
 | `POST /api/settings` | JSON `{tz, time_fmt, date_fmt, name, labels[12]}` | All fields are optional. The values are validated, saved, and the screen is redrawn. |
 | `POST /api/icon?pos=N` | multipart file (14,112 bytes, 84×84 RGB565 BE) | |
 | `POST /api/icon/delete?pos=N` | – | |
-| `POST /api/wifi` | JSON `{ssid, pass}` | The device restarts |
-| `POST /api/press?pos=N` | – | Simulates a touch on position N (for testing) |
+| `POST /api/wifi` | JSON `{ssid, pass}` | The deck asks "Change WiFi?" on screen. **Yes** within 30 s saves the credentials and restarts; **No** or a timeout returns `403 declined on the deck`. The request blocks while the question is shown. |
+| `POST /api/press?pos=N` | – | Simulates a touch on position N. **Only in builds with `-D CYDSD_DEBUG_API`**; otherwise 404. |
 
 ## 6. Security considerations
 
-* The HTTP API and UDP protocol are unauthenticated and intended for a trusted home LAN. Anyone on the LAN could change the icons, labels or WiFi credentials, or trigger a press.
+The full review and improvement plan is in [Security-Review.md](Security-Review.md). In summary, the threat model is:
+
+| Party | Trusted? | Protection |
+|---|---|---|
+| Web pages in a browser on the LAN | **No** | HTTP request rules in §5.3: `Host` check, `X-CYDSD` header, no `Origin`, no CORS |
+| Other devices on the home LAN | **No**, but only partly protected until message authentication is added | The daemon only accepts datagrams from the deck's address and rate-limits presses. WiFi changes need a tap on the deck. Spoofing the deck's IP address is still possible on the LAN. |
+| Someone with physical access (USB, the touchscreen, the flash chip) | Yes | – |
+
 * A press can only trigger actions that the PC owner has configured. The device never sends commands or paths to the PC, only a grid position, so a rogue device or spoofed packet can at most run one of the user's own configured actions.
+* Settings, icons and labels can still be changed by a LAN host that sends the right headers. The UDP subscription can also be abused by LAN hosts (Security-Review F5).
 * The setup access point is open. It exists only until credentials are verified, and it is shown on the device screen while active.
-* Windows Firewall may ask, the first time the daemon runs, whether Python may use the network. Allow it on **Private** networks.
+* Nothing needs to be reachable from the internet. **Do not port-forward** ports 80, 47800 or 47801 on the router. Give the deck a **DHCP reservation**, so the daemon's trusted address stays correct.
+* **Windows Firewall:** decline the program-wide "allow Python" prompt, or delete the rule it created, and add a scoped rule instead (run as administrator, adjusting the IP and path):
+
+  ```powershell
+  New-NetFirewallRule -DisplayName "CYD Stream Deck daemon" -Direction Inbound -Action Allow `
+    -Protocol UDP -LocalPort 47801 -RemoteAddress 192.168.1.198 -Profile Private `
+    -Program "$env:LOCALAPPDATA\Programs\Python\Python314\pythonw.exe"
+  ```
 
 ## 7. Building, flashing and running
 
@@ -281,3 +305,19 @@ pythonw cydsd_daemon.py         # or tick "Start daemon when I sign in to Window
 | Daemon idle footprint | 0.03 CPU-s/min, 33 MB |
 | Configuration GUI start-up, edit, save, full upload | Passed |
 | Physical touch on the panel | Not tested here. Presses were injected through `/api/press`, which runs the same code path as a touch. The touch calibration is carried over unchanged from Clocky. |
+
+### 8.1 Security hardening, firmware 1.1.0 (2026-10-21)
+
+| Test | Result |
+|---|---|
+| Firmware compile and upload | Passed. RAM 14.9 %, flash 44.3 %. |
+| `GET /api/info` with a valid `Host`; no `Access-Control-Allow-Origin` header | Passed (200) |
+| `GET /api/info` with `Host: attacker.example` | Passed (403) |
+| `POST` without `X-CYDSD`, or with `Origin` (including `Origin: null`) | Passed (403) |
+| `POST /api/settings` with a `text/plain` body | Passed (400) |
+| `POST /api/press` in a release build | Passed (404) |
+| Configuration application client: info and settings upload | Passed |
+| `POST /api/wifi` with nobody touching the screen | Passed: 403 "declined on the deck" after 31 s, and the deck stayed on the network |
+| Daemon: forged `PRESS` from an address other than the deck's | Passed: no ACK, no action, one log line |
+| Daemon: 50 presses in a burst | Passed: 4 ran, the rest were dropped |
+| Daemon: a position pressed again while its actions are still running | Passed: not queued twice |

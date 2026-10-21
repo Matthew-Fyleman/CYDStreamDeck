@@ -7,6 +7,8 @@
 | PC software reviewed | `pc/cydsd_common.py`, `pc/cydsd_daemon.py`, `pc/cydsd_config.py` |
 | Scope | Two-way communication between the Windows PC and the CYD over a home broadband network (WiFi/LAN), plus the first-boot setup portal. USB serial is covered briefly. |
 
+> **Status (firmware 1.1.0, 2026-10-21):** the quick wins from §4 are implemented: 4.1 (the `Host` check, the `X-CYDSD` header, no `Origin`, a JSON content type, and no CORS header), 4.2, 4.3 and 4.4. The exception in 4.4 is binding to the LAN interface; source-address filtering is used instead. Sections 4.5–4.7 are user setup, and they are now documented in the FSD §6 and the README. Sections 5 (pairing and HMAC) and 6 (setup AP) are still open. Test results are in FSD §8.1.
+
 ## 1. Summary
 
 The overall architecture is sound. **Nothing crosses the internet.** The deck and the PC talk directly to each other on the home LAN, and the only traffic that leaves the house is the deck's NTP time requests. There is no cloud service, no port forwarding, no UPnP and no OTA update channel. Above all, **the deck only sends a grid position, never a command**, so the PC's `config.json` is the only thing that decides what runs. That is the right design, and it should be kept.

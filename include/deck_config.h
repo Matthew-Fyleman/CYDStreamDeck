@@ -5,7 +5,7 @@
 // Compile-time constants shared by all firmware modules.
 namespace Deck {
 
-constexpr const char* kFirmwareVersion = "1.0.0";
+constexpr const char* kFirmwareVersion = "1.1.0";
 
 // Display geometry (landscape, setRotation(1)).
 constexpr int16_t kScreenW = 480;

@@ -10,7 +10,14 @@ A CYD-based touch stream deck. A 4" ESP32 "Cheap Yellow Display" shows a 3×4 gr
 * **Daemon** (`pc/cydsd_daemon.py`): a lightweight background listener (WiFi/UDP, plus optional USB serial with auto-detection) that runs the configured actions.
 * **Configuration app** (`pc/cydsd_config.py`): a Tkinter GUI for icons, actions, time zone, time/date formats and WiFi, with upload to the deck over WiFi or USB.
 
-The full functional specification is in [docs/FSD.md](docs/FSD.md).
+The full functional specification is in [docs/FSD.md](docs/FSD.md), and the network security review is in [docs/Security-Review.md](docs/Security-Review.md).
+
+## Network safety
+
+* Everything stays on your home network, so **don't port-forward** anything to the deck or the PC.
+* Give the deck a **DHCP reservation** on your router. The daemon only accepts presses from the deck's configured IP address.
+* Keep the deck on your main (or IoT) network, not a guest network with client isolation.
+* For Windows Firewall, prefer the scoped rule in FSD §6 over the program-wide "allow Python" prompt.
 
 ## Quick start
 

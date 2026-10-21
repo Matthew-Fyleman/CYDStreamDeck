@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import logging
 import logging.handlers
 import os
@@ -31,6 +32,10 @@ HEARTBEAT_S = 15          # SUBSCRIBE interval (device expires us after 60 s)
 SERIAL_PING_S = 10
 SERIAL_RESCAN_S = 10
 DEDUPE_S = 5.0
+RATE_PER_S = 2.0          # sustained presses per second accepted...
+RATE_BURST = 4            # ...with short bursts up to this many
+MAX_WORKERS = 2
+SUBSCRIBE_FALLBACK_S = 45  # broadcast again if the deck has not replied for this long
 
 log = logging.getLogger("cydsd")
 
@@ -65,6 +70,10 @@ class ConfigWatcher:
     def device_id(self) -> str:
         return self.cfg["device"].get("id", "").strip()
 
+    @property
+    def device_ip(self) -> str:
+        return self.cfg["device"].get("ip", "").strip()
+
     def accepts(self, dev_id: str) -> bool:
         return not self.device_id or dev_id.upper() == self.device_id.upper()
 
@@ -78,7 +87,7 @@ def run_action(action: dict) -> None:
     kind = action.get("type")
     target = os.path.expandvars(str(action.get("target", "")).strip())
     if kind == "run":
-        args = action.get("args", "") or None
+        args = action.get("args", "") or ""  # startfile() rejects None here
         cwd = action.get("cwd", "") or os.path.dirname(target) or None
         if cwd and not os.path.isdir(cwd):
             cwd = None
@@ -111,15 +120,35 @@ def run_actions(pos: int, cfg: dict) -> None:
 
 
 class Dispatcher:
-    """De-duplicates presses arriving over both transports / retries and runs
-    actions off the network thread."""
+    """De-duplicates presses arriving over both transports / retries, limits
+    their rate, and runs actions on a small worker pool off the network thread.
+    A position whose actions are still queued or running is not queued again,
+    so a flood of presses cannot pile up more than one run per button."""
 
     def __init__(self, watcher: ConfigWatcher):
         self.watcher = watcher
         self._seen: dict[tuple[str, str], float] = {}
         self._lock = threading.Lock()
+        self._tokens = float(RATE_BURST)
+        self._refilled = time.monotonic()
+        self._busy: set[int] = set()
+        self._dropped = 0
+        self._dropped_logged = 0.0
+        self._pool = concurrent.futures.ThreadPoolExecutor(MAX_WORKERS, thread_name_prefix="actions")
+
+    def _take_token(self, now: float) -> bool:
+        self._tokens = min(RATE_BURST, self._tokens + (now - self._refilled) * RATE_PER_S)
+        self._refilled = now
+        if self._tokens < 1:
+            return False
+        self._tokens -= 1
+        return True
 
     def press(self, dev_id: str, pos: str, seq: str, via: str) -> None:
+        try:
+            p = int(pos)
+        except ValueError:
+            return
         now = time.monotonic()
         with self._lock:
             self._seen = {k: t for k, t in self._seen.items() if now - t < DEDUPE_S}
@@ -127,13 +156,27 @@ class Dispatcher:
             if key in self._seen:
                 return
             self._seen[key] = now
+            if not self._take_token(now):
+                self._dropped += 1
+                if now - self._dropped_logged >= 1.0:  # one line per second, not per packet
+                    log.warning("Rate limit: dropped %d press(es), latest from %s via %s",
+                                self._dropped, dev_id, via)
+                    self._dropped, self._dropped_logged = 0, now
+                return
+            if p in self._busy:
+                log.info("Press from %s via %s: pos=%s still running, ignored", dev_id, via, pos)
+                return
+            self._busy.add(p)
         self.watcher.check()
         log.info("Press from %s via %s: pos=%s seq=%s", dev_id, via, pos, seq)
+        self._pool.submit(self._run, p, self.watcher.cfg)
+
+    def _run(self, pos: int, cfg: dict) -> None:
         try:
-            p = int(pos)
-        except ValueError:
-            return
-        threading.Thread(target=run_actions, args=(p, self.watcher.cfg), daemon=True).start()
+            run_actions(pos, cfg)
+        finally:
+            with self._lock:
+                self._busy.discard(pos)
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +265,15 @@ def udp_loop(watcher: ConfigWatcher, dispatcher: Dispatcher, stop: threading.Eve
     log.info("Listening for the deck on UDP port %d", common.DAEMON_UDP_PORT)
 
     last_heartbeat = 0.0
-    device_ip = ""
+    last_subscribed = 0.0
+    learned_ip = ""  # first deck address seen, used when the config has no IP
     subscribed = False
+    rejected_logged: set[str] = set()
+
+    def deck_ip() -> str:
+        # The configured address wins; a DHCP reservation keeps it valid.
+        return watcher.device_ip or learned_ip
+
     while not stop.is_set():
         now = time.monotonic()
         if now - last_heartbeat >= HEARTBEAT_S:
@@ -231,10 +281,10 @@ def udp_loop(watcher: ConfigWatcher, dispatcher: Dispatcher, stop: threading.Eve
             watcher.check()
             target = watcher.device_id or "*"
             msg = f"{common.TAG} SUBSCRIBE {target}".encode()
-            dests = set(common.local_broadcast_addresses())
-            for ip in (device_ip, watcher.cfg["device"].get("ip", "")):
-                if ip:
-                    dests.add(ip)
+            # Unicast to the deck once it answers; broadcast only to find it.
+            dests = {deck_ip()} if deck_ip() else set()
+            if not dests or now - last_subscribed > SUBSCRIBE_FALLBACK_S:
+                dests |= set(common.local_broadcast_addresses())
             for addr in dests:
                 try:
                     sock.sendto(msg, (addr, common.DEVICE_UDP_PORT))
@@ -251,16 +301,26 @@ def udp_loop(watcher: ConfigWatcher, dispatcher: Dispatcher, stop: threading.Eve
         parts = data.decode(errors="replace").strip().split()
         if len(parts) < 2 or parts[0] != common.TAG:
             continue
+        # Only the deck's own address is trusted. Anything else is dropped
+        # without an ACK, with one log line per address.
+        if deck_ip() and addr[0] != deck_ip():
+            if addr[0] not in rejected_logged:
+                rejected_logged.add(addr[0])
+                log.warning("Ignoring %s from %s (deck is at %s; use 'Find device' if it moved)",
+                            parts[1], addr[0], deck_ip())
+            continue
         if parts[1] == "PRESS" and len(parts) == 5:
             _, _, dev_id, pos, seq = parts
-            sock.sendto(f"{common.TAG} ACK {seq}".encode(), addr)
             if watcher.accepts(dev_id):
+                sock.sendto(f"{common.TAG} ACK {seq}".encode(), addr)
                 dispatcher.press(dev_id, pos, seq, f"WiFi {addr[0]}")
         elif parts[1] == "SUBSCRIBED" and len(parts) >= 3 and watcher.accepts(parts[2]):
-            if not subscribed or device_ip != addr[0]:
+            if not subscribed:
                 log.info("Subscribed to %s at %s", parts[2], addr[0])
             subscribed = True
-            device_ip = addr[0]
+            last_subscribed = now
+            if not watcher.device_ip:
+                learned_ip = addr[0]
 
 
 # ---------------------------------------------------------------------------

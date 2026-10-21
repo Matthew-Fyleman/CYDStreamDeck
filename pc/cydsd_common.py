@@ -412,6 +412,9 @@ class DeviceClient:
     def _http(self, path: str, body: bytes | None = None, content_type: str = "application/json",
               timeout: float = 10) -> dict:
         req = urllib.request.Request(f"http://{self.ip}{path}", data=body, method="POST" if body is not None else "GET")
+        # The deck rejects POSTs without this header, which a web page cannot add
+        # to a cross-site request.
+        req.add_header("X-CYDSD", "1")
         if body is not None:
             req.add_header("Content-Type", content_type)
         try:
@@ -463,7 +466,8 @@ class DeviceClient:
         if self.transport == "serial":
             self.session.command("WIFI " + payload)
         else:
-            self._http("/api/wifi", payload.encode())
+            # Waits while someone accepts or declines the change on the touchscreen.
+            self._http("/api/wifi", payload.encode(), timeout=45)
 
 
 def device_settings_payload(cfg: dict) -> dict:

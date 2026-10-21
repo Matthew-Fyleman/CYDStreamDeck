@@ -293,6 +293,45 @@ void showMessage(const char* title, const String& body) {
   }
 }
 
+bool confirm(const char* title, const String& body, uint32_t timeoutMs) {
+  TFT_eSPI& tft = *gTft;
+  showMessage(title, body);
+  constexpr int16_t kBtnW = 160, kBtnH = 56, kBtnY = 240;
+  constexpr int16_t kNoX = 60, kYesX = Deck::kScreenW - 60 - kBtnW;
+  tft.setTextDatum(MC_DATUM);
+  tft.fillSmoothRoundRect(kNoX, kBtnY, kBtnW, kBtnH, 10, 0x8000, kBg);
+  tft.setTextColor(TFT_WHITE, 0x8000);
+  tft.drawString("No", kNoX + kBtnW / 2, kBtnY + kBtnH / 2, 4);
+  tft.fillSmoothRoundRect(kYesX, kBtnY, kBtnW, kBtnH, 10, 0x0400, kBg);
+  tft.setTextColor(TFT_WHITE, 0x0400);
+  tft.drawString("Yes", kYesX + kBtnW / 2, kBtnY + kBtnH / 2, 4);
+
+  auto inBtn = [](int16_t x, int16_t y, int16_t bx) {
+    return x >= bx && x < bx + kBtnW && y >= kBtnY && y < kBtnY + kBtnH;
+  };
+  const uint32_t start = millis();
+  int choice = -1;  // 0 = No, 1 = Yes
+  while (choice < 0 && millis() - start < timeoutMs) {
+    int16_t x, y;
+    if (readTouch(x, y)) {
+      if (inBtn(x, y, kYesX)) choice = 1;
+      else if (inBtn(x, y, kNoX)) choice = 0;
+    }
+    delay(10);
+  }
+  // Wait for the finger to lift so the tap is not seen again as a grid press.
+  uint8_t released = 0;
+  const uint32_t liftStart = millis();
+  while (released < 5 && millis() - liftStart < 3000) {
+    int16_t x, y;
+    released = readTouch(x, y) ? 0 : released + 1;
+    delay(10);
+  }
+  gTouchDown = false;
+  gDownTarget = -2;
+  return choice == 1;
+}
+
 void loop() {
   handleTouch();
   const uint32_t now = millis();

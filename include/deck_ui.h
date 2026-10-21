@@ -22,6 +22,10 @@ void onPressAcked(int pos);
 // Full-screen text page (used by setup portal and boot messages).
 void showMessage(const char* title, const String& body);
 
+// Full-screen Yes/No question. Blocks until a button is tapped and released,
+// or until timeoutMs passes (counts as No). The caller redraws afterwards.
+bool confirm(const char* title, const String& body, uint32_t timeoutMs = 30000);
+
 // Raw touch sampling, mapped to landscape pixels.
 bool readTouch(int16_t& x, int16_t& y);
 

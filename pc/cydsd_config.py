@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import winreg
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -22,7 +23,11 @@ import cydsd_common as common
 HERE = Path(__file__).resolve().parent
 DAEMON_SCRIPT = HERE / "cydsd_daemon.py"
 STARTUP_DIR = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-STARTUP_LAUNCHER = STARTUP_DIR / "CYD Stream Deck daemon.vbs"
+LEGACY_LAUNCHER = STARTUP_DIR / "CYD Stream Deck daemon.vbs"
+# Autostart uses a per-user Run registry value rather than a generated script:
+# antivirus (e.g. Bitdefender) quarantines Python that writes .vbs launchers.
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "CYD Stream Deck daemon"
 THUMB = 72
 
 
@@ -30,6 +35,27 @@ def pythonw() -> str:
     exe = Path(sys.executable)
     candidate = exe.with_name("pythonw.exe")
     return str(candidate if candidate.exists() else exe)
+
+
+def autostart_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, RUN_VALUE)
+        return True
+    except OSError:
+        return False
+
+
+def set_autostart(enabled: bool) -> None:
+    LEGACY_LAUNCHER.unlink(missing_ok=True)
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, f'"{pythonw()}" "{DAEMON_SCRIPT}"')
+        else:
+            try:
+                winreg.DeleteValue(key, RUN_VALUE)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +312,7 @@ class ConfigApp(tk.Tk):
         bottom.pack(fill="x", padx=10, pady=(4, 10))
         ttk.Button(bottom, text="Save", command=self.save).pack(side="left")
         ttk.Button(bottom, text="Save and upload to deck", command=self.upload).pack(side="left", padx=6)
-        self.autostart = tk.BooleanVar(value=STARTUP_LAUNCHER.exists())
+        self.autostart = tk.BooleanVar(value=autostart_enabled())
         ttk.Checkbutton(bottom, text="Start daemon when I sign in to Windows", variable=self.autostart,
                         command=self.toggle_autostart).pack(side="right")
         ttk.Button(bottom, text="Start daemon now", command=self.start_daemon).pack(side="right", padx=6)
@@ -637,7 +663,10 @@ class ConfigApp(tk.Tk):
             with self.client() as dev:
                 dev.set_wifi(ssid, pw)
 
-        self.run_bg("Sending WiFi credentials", work,
+        if self.cfg["device"]["transport"] != "serial":
+            messagebox.showinfo("Set deck WiFi", "Tap Yes on the deck's screen within 30 seconds "
+                                "to accept the new network.")
+        self.run_bg("Sending WiFi credentials (accept on the deck)", work,
                     lambda _: self.set_status("WiFi credentials sent; the deck is restarting. "
                                               "Use 'Find device' in ~20 s to get its new address."))
 
@@ -650,14 +679,10 @@ class ConfigApp(tk.Tk):
 
     def toggle_autostart(self):
         try:
+            set_autostart(self.autostart.get())
             if self.autostart.get():
-                STARTUP_DIR.mkdir(parents=True, exist_ok=True)
-                cmd = f'""{pythonw()}"" ""{DAEMON_SCRIPT}""'
-                STARTUP_LAUNCHER.write_text(
-                    f'CreateObject("WScript.Shell").Run "{cmd}", 0, False\r\n', encoding="utf-8")
-                self.set_status(f"Created {STARTUP_LAUNCHER}")
+                self.set_status("Daemon will start when you sign in to Windows.")
             else:
-                STARTUP_LAUNCHER.unlink(missing_ok=True)
                 self.set_status("Daemon will no longer start at sign-in.")
         except Exception as e:
             messagebox.showerror("Start at sign-in", str(e))
